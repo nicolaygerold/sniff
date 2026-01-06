@@ -10,10 +10,10 @@ const binPath = join(binDir, "sniff");
 
 // Platform to package mapping
 const PLATFORMS = {
-  "darwin-arm64": "@nicgerold/sniff-darwin-arm64",
-  "darwin-x64": "@nicgerold/sniff-darwin-x64",
-  "linux-arm64": "@nicgerold/sniff-linux-arm64",
-  "linux-x64": "@nicgerold/sniff-linux-x64",
+  "darwin-arm64": "@nicolaygerold/sniff-darwin-arm64",
+  "darwin-x64": "@nicolaygerold/sniff-darwin-x64",
+  "linux-arm64": "@nicolaygerold/sniff-linux-arm64",
+  "linux-x64": "@nicolaygerold/sniff-linux-x64",
 };
 
 function getPlatformPackage() {

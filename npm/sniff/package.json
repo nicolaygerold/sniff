@@ -1,5 +1,5 @@
 {
-  "name": "@nicgerold/sniff",
+  "name": "@nicolaygerold/sniff",
   "version": "0.0.0",
   "description": "Fast fuzzy file finder written in Zig",
   "author": "Nicolay Gerold",
@@ -44,10 +44,10 @@
     "build": "tsc && node scripts/build-cjs.js"
   },
   "optionalDependencies": {
-    "@nicgerold/sniff-darwin-arm64": "0.0.0",
-    "@nicgerold/sniff-darwin-x64": "0.0.0",
-    "@nicgerold/sniff-linux-arm64": "0.0.0",
-    "@nicgerold/sniff-linux-x64": "0.0.0"
+    "@nicolaygerold/sniff-darwin-arm64": "0.0.0",
+    "@nicolaygerold/sniff-darwin-x64": "0.0.0",
+    "@nicolaygerold/sniff-linux-arm64": "0.0.0",
+    "@nicolaygerold/sniff-linux-x64": "0.0.0"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

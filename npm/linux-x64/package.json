@@ -1,5 +1,5 @@
 {
-  "name": "@nicgerold/sniff-linux-x64",
+  "name": "@nicolaygerold/sniff-linux-x64",
   "version": "0.0.0",
   "description": "Sniff binary for linux-x64",
   "os": ["linux"],

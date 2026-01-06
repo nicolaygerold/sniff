@@ -91,7 +91,7 @@ jobs:
           jq --arg v "$VERSION" '.version = $v' package.json > tmp.json
           mv tmp.json package.json
           # Update optionalDependencies versions
-          jq --arg v "$VERSION" '.optionalDependencies["@nicgerold/sniff-darwin-arm64"] = $v | .optionalDependencies["@nicgerold/sniff-darwin-x64"] = $v | .optionalDependencies["@nicgerold/sniff-linux-arm64"] = $v | .optionalDependencies["@nicgerold/sniff-linux-x64"] = $v' package.json > tmp.json
+          jq --arg v "$VERSION" '.optionalDependencies["@nicolaygerold/sniff-darwin-arm64"] = $v | .optionalDependencies["@nicolaygerold/sniff-darwin-x64"] = $v | .optionalDependencies["@nicolaygerold/sniff-linux-arm64"] = $v | .optionalDependencies["@nicolaygerold/sniff-linux-x64"] = $v' package.json > tmp.json
           mv tmp.json package.json
           # Install deps and build
           npm install
