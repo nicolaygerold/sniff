@@ -41,13 +41,7 @@
   ],
   "scripts": {
     "postinstall": "node scripts/postinstall.js",
-    "build": "tsc && node scripts/build-cjs.js"
-  },
-  "optionalDependencies": {
-    "@nicolaygerold/sniff-darwin-arm64": "0.0.0",
-    "@nicolaygerold/sniff-darwin-x64": "0.0.0",
-    "@nicolaygerold/sniff-linux-arm64": "0.0.0",
-    "@nicolaygerold/sniff-linux-x64": "0.0.0"
+    "build": "tsc"
   },
   "devDependencies": {
     "@types/node": "^20.0.0",

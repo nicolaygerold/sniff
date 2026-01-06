@@ -1,8 +1,0 @@
-{
-  "name": "@nicolaygerold/sniff-darwin-x64",
-  "version": "0.0.0",
-  "description": "Sniff binary for darwin-x64",
-  "os": ["darwin"],
-  "cpu": ["x64"],
-  "files": ["bin"]
-}
