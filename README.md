@@ -15,7 +15,7 @@ Fast fuzzy file finder written in Zig. Inspired by VSCode and Zed's file pickers
 ### npm (recommended)
 
 ```bash
-npm install @nicgerold/sniff
+npm install @nicolaygerold/sniff
 ```
 
 ### Homebrew (coming soon)
@@ -51,7 +51,7 @@ sniff --json /path/to/project
 ### TypeScript/JavaScript
 
 ```typescript
-import Sniff from '@nicgerold/sniff';
+import Sniff from '@nicolaygerold/sniff';
 
 const sniff = new Sniff();
 await sniff.init('/path/to/project');
