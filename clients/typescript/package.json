@@ -1,0 +1,17 @@
+{
+  "name": "sniff-client",
+  "version": "0.1.0",
+  "description": "TypeScript client for Sniff fuzzy file finder",
+  "main": "dist/sniff.js",
+  "types": "dist/sniff.d.ts",
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc",
+    "example": "npx tsx example.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0",
+    "tsx": "^4.0.0"
+  }
+}

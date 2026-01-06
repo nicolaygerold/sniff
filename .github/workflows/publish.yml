@@ -1,0 +1,128 @@
+name: Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  ZIG_VERSION: "0.13.0"
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-macos
+            npm_pkg: darwin-arm64
+          - os: macos-latest
+            target: x86_64-macos
+            npm_pkg: darwin-x64
+          - os: ubuntu-latest
+            target: aarch64-linux
+            npm_pkg: linux-arm64
+          - os: ubuntu-latest
+            target: x86_64-linux
+            npm_pkg: linux-x64
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: goto-bus-stop/setup-zig@v2
+        with:
+          version: ${{ env.ZIG_VERSION }}
+
+      - name: Build
+        run: zig build -Doptimize=ReleaseSafe -Dtarget=${{ matrix.target }}
+
+      - name: Copy binary to npm package
+        run: |
+          mkdir -p npm/${{ matrix.npm_pkg }}/bin
+          cp zig-out/bin/sniff npm/${{ matrix.npm_pkg }}/bin/sniff
+          chmod +x npm/${{ matrix.npm_pkg }}/bin/sniff
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sniff-${{ matrix.npm_pkg }}
+          path: npm/${{ matrix.npm_pkg }}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Set version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+
+      - name: Prepare platform packages
+        run: |
+          for platform in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
+            # Copy artifact to npm directory
+            cp -r artifacts/sniff-$platform/* npm/$platform/
+            # Update version
+            jq --arg v "$VERSION" '.version = $v' npm/$platform/package.json > tmp.json
+            mv tmp.json npm/$platform/package.json
+            # Update optionalDependencies version in main package
+          done
+
+      - name: Prepare main package
+        run: |
+          cd npm/sniff
+          # Update version
+          jq --arg v "$VERSION" '.version = $v' package.json > tmp.json
+          mv tmp.json package.json
+          # Update optionalDependencies versions
+          jq --arg v "$VERSION" '.optionalDependencies["@nicgerold/sniff-darwin-arm64"] = $v | .optionalDependencies["@nicgerold/sniff-darwin-x64"] = $v | .optionalDependencies["@nicgerold/sniff-linux-arm64"] = $v | .optionalDependencies["@nicgerold/sniff-linux-x64"] = $v' package.json > tmp.json
+          mv tmp.json package.json
+          # Install deps and build
+          npm install
+          npx tsc
+
+      - name: Publish platform packages
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          for platform in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
+            cd npm/$platform
+            npm publish --access public --provenance || true
+            cd ../..
+          done
+
+      - name: Publish main package
+        working-directory: npm/sniff
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public --provenance
+
+      - name: Create GitHub Release
+        run: gh release create ${{ github.ref_name }} --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Upload binaries to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for platform in darwin-arm64 darwin-x64 linux-arm64 linux-x64; do
+            tar -czvf sniff-$platform.tar.gz -C npm/$platform/bin sniff
+            gh release upload ${{ github.ref_name }} sniff-$platform.tar.gz
+          done

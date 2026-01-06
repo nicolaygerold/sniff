@@ -1,0 +1,29 @@
+# Zig
+zig-out/
+.zig-cache/
+*.o
+*.a
+
+# Node
+node_modules/
+dist/
+*.log
+.npm/
+package-lock.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Build artifacts
+*.tar.gz
+*.zip
+
+# npm packages (built during CI)
+npm/*/bin/

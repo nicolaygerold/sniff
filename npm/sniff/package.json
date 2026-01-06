@@ -1,0 +1,59 @@
+{
+  "name": "@nicgerold/sniff",
+  "version": "0.0.0",
+  "description": "Fast fuzzy file finder written in Zig",
+  "author": "Nicolay Gerold",
+  "license": "MIT",
+  "keywords": [
+    "fuzzy",
+    "finder",
+    "search",
+    "files",
+    "zig",
+    "fast"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nicolaygerold/sniff"
+  },
+  "homepage": "https://github.com/nicolaygerold/sniff",
+  "bugs": {
+    "url": "https://github.com/nicolaygerold/sniff/issues"
+  },
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "sniff": "./bin/sniff"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "bin",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js",
+    "build": "tsc && node scripts/build-cjs.js"
+  },
+  "optionalDependencies": {
+    "@nicgerold/sniff-darwin-arm64": "0.0.0",
+    "@nicgerold/sniff-darwin-x64": "0.0.0",
+    "@nicgerold/sniff-linux-arm64": "0.0.0",
+    "@nicgerold/sniff-linux-x64": "0.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
