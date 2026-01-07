@@ -1,6 +1,6 @@
 const std = @import("std");
 const PathIndex = @import("index.zig").PathIndex;
-const GitIgnore = @import("gitignore.zig").GitIgnore;
+const FastGitIgnore = @import("fast_gitignore.zig").FastGitIgnore;
 
 pub const ScanConfig = struct {
     max_depth: usize = 20,
@@ -24,27 +24,19 @@ pub const Scanner = struct {
     index: *PathIndex,
     config: ScanConfig,
     root_len: usize,
-    gitignore: GitIgnore,
-    gitignore_stack: std.ArrayList(GitIgnoreEntry),
-
-    const GitIgnoreEntry = struct {
-        depth: usize,
-        pattern_count: usize, // Number of patterns added at this level
-    };
+    gitignore: FastGitIgnore,
 
     pub fn init(index: *PathIndex, config: ScanConfig) Scanner {
         return .{
             .index = index,
             .config = config,
             .root_len = 0,
-            .gitignore = GitIgnore.init(index.arena.allocator()),
-            .gitignore_stack = std.ArrayList(GitIgnoreEntry).init(index.arena.allocator()),
+            .gitignore = FastGitIgnore.init(index.arena.allocator()),
         };
     }
 
     pub fn deinit(self: *Scanner) void {
         self.gitignore.deinit();
-        self.gitignore_stack.deinit();
     }
 
     pub fn scan(self: *Scanner, root: []const u8) !void {
@@ -59,16 +51,13 @@ pub const Scanner = struct {
         // Load root .gitignore
         if (self.config.respect_gitignore) {
             try self.gitignore.loadFile(dir);
-            try self.gitignore_stack.append(.{
-                .depth = 0,
-                .pattern_count = self.gitignore.patterns.items.len,
-            });
+            try self.gitignore.pushSnapshot(0);
         }
 
         try self.scanDir(dir, "", 0);
     }
 
-    fn scanDir(self: *Scanner, dir: std.fs.Dir, prefix: []const u8, depth: usize) !void {
+    pub fn scanDir(self: *Scanner, dir: std.fs.Dir, prefix: []const u8, depth: usize) !void {
         if (depth > self.config.max_depth) return;
 
         var iter = dir.iterate();
@@ -76,15 +65,35 @@ pub const Scanner = struct {
             const is_dir = entry.kind == .directory;
             const name = entry.name;
 
-            // Build relative path
+            // Fast path: check hidden files first (most common filter)
+            if (self.config.ignore_hidden and name.len > 0 and name[0] == '.') {
+                continue;
+            }
+
+            // Fast path: hardcoded ignore patterns
+            if (self.shouldIgnoreName(name)) {
+                continue;
+            }
+
+            // AGGRESSIVE DIRECTORY PRUNING - key optimization
+            // Check if we should skip this entire directory BEFORE recursing
+            if (is_dir and self.config.respect_gitignore) {
+                if (self.gitignore.shouldSkipDir(name)) {
+                    continue;
+                }
+            }
+
+            // Build relative path (only if we're not skipping)
             const rel_path = if (prefix.len == 0)
                 try self.index.arena.allocator().dupe(u8, name)
             else
                 try std.fmt.allocPrint(self.index.arena.allocator(), "{s}/{s}", .{ prefix, name });
 
-            // Check if should ignore
-            if (self.shouldIgnore(rel_path, name, is_dir)) {
-                continue;
+            // Check gitignore for files (dirs already checked above for pruning)
+            if (self.config.respect_gitignore and !is_dir) {
+                if (self.gitignore.isFileIgnored(name, rel_path, false)) {
+                    continue;
+                }
             }
 
             if (is_dir) {
@@ -93,37 +102,16 @@ pub const Scanner = struct {
                 defer sub_dir.close();
 
                 // Load nested .gitignore if present
-                const prev_pattern_count = self.gitignore.patterns.items.len;
                 if (self.config.respect_gitignore) {
+                    try self.gitignore.pushSnapshot(depth + 1);
                     self.gitignore.loadFile(sub_dir) catch {};
-                    const new_count = self.gitignore.patterns.items.len;
-                    if (new_count > prev_pattern_count) {
-                        try self.gitignore_stack.append(.{
-                            .depth = depth + 1,
-                            .pattern_count = new_count,
-                        });
-                    }
                 }
 
                 try self.scanDir(sub_dir, rel_path, depth + 1);
 
                 // Pop gitignore patterns when leaving directory
                 if (self.config.respect_gitignore) {
-                    while (self.gitignore_stack.items.len > 0) {
-                        const last = self.gitignore_stack.items[self.gitignore_stack.items.len - 1];
-                        if (last.depth > depth) {
-                            // Remove patterns added in deeper directories
-                            self.gitignore.patterns.shrinkRetainingCapacity(
-                                if (self.gitignore_stack.items.len > 1)
-                                    self.gitignore_stack.items[self.gitignore_stack.items.len - 2].pattern_count
-                                else
-                                    0,
-                            );
-                            _ = self.gitignore_stack.pop();
-                        } else {
-                            break;
-                        }
-                    }
+                    self.gitignore.popToDepth(depth);
                 }
             } else {
                 // Add file to index
@@ -132,26 +120,12 @@ pub const Scanner = struct {
         }
     }
 
-    fn shouldIgnore(self: *Scanner, path: []const u8, name: []const u8, is_dir: bool) bool {
-        // Check hidden files
-        if (self.config.ignore_hidden and name.len > 0 and name[0] == '.') {
-            return true;
-        }
-
-        // Check hardcoded ignore patterns
+    fn shouldIgnoreName(self: *Scanner, name: []const u8) bool {
         for (self.config.ignore_patterns) |pattern| {
             if (std.mem.eql(u8, name, pattern)) {
                 return true;
             }
         }
-
-        // Check gitignore
-        if (self.config.respect_gitignore) {
-            if (self.gitignore.isIgnored(path, is_dir)) {
-                return true;
-            }
-        }
-
         return false;
     }
 };

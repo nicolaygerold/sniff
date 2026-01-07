@@ -51,6 +51,29 @@ pub const PathIndex = struct {
         });
     }
 
+    pub fn removePath(self: *PathIndex, path: []const u8) void {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            if (std.mem.eql(u8, self.entries.items[i].path, path)) {
+                _ = self.entries.swapRemove(i);
+                // Don't increment i, check the swapped element
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    pub fn removePathsWithPrefix(self: *PathIndex, prefix: []const u8) void {
+        var i: usize = 0;
+        while (i < self.entries.items.len) {
+            if (std.mem.startsWith(u8, self.entries.items[i].path, prefix)) {
+                _ = self.entries.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     pub fn clear(self: *PathIndex) void {
         self.entries.clearRetainingCapacity();
         _ = self.arena.reset(.retain_capacity);

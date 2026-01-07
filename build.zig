@@ -29,6 +29,23 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run the sniff CLI");
     run_step.dependOn(&run_cmd.step);
 
+    // Benchmark executable
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+    });
+    b.installArtifact(bench_exe);
+
+    const bench_cmd = b.addRunArtifact(bench_exe);
+    bench_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| {
+        bench_cmd.addArgs(args);
+    }
+    const bench_step = b.step("bench", "Run scanner benchmark");
+    bench_step.dependOn(&bench_cmd.step);
+
     const lib = b.addStaticLibrary(.{
         .name = "sniff",
         .root_source_file = b.path("src/root.zig"),
