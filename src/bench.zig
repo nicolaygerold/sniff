@@ -84,8 +84,9 @@ pub fn main() !void {
     std.debug.print("  Average: {d}ms\n\n", .{fast_avg});
 
     // Benchmark parallel scanner WITHOUT gitignore
+    const thread_count = std.Thread.getCpuCount() catch 4;
     std.debug.print("=== Parallel scanner (no gitignore) ===\n", .{});
-    std.debug.print("({d} threads)\n\n", .{std.Thread.getCpuCount() catch 4});
+    std.debug.print("({d} threads)\n\n", .{thread_count});
     var para_total: i64 = 0;
     var para_count: usize = 0;
     for (0..3) |i| {
@@ -107,15 +108,15 @@ pub fn main() !void {
 
     // Summary
     std.debug.print("=== Summary ===\n\n", .{});
-    std.debug.print("  Baseline (no gitignore):   {d} files in {d}ms\n", .{ baseline_count, baseline_avg });
-    std.debug.print("  FastGitIgnore:             {d} files in {d}ms\n", .{ fast_count, fast_avg });
-    std.debug.print("  Parallel (no gitignore):   {d} files in {d}ms\n\n", .{ para_count, para_avg });
+    std.debug.print("  Baseline (no gitignore):        {d} files in {d}ms\n", .{ baseline_count, baseline_avg });
+    std.debug.print("  Sequential + FastGitIgnore:     {d} files in {d}ms\n", .{ fast_count, fast_avg });
+    std.debug.print("  Parallel (no gitignore):        {d} files in {d}ms\n\n", .{ para_count, para_avg });
 
     const gitignore_overhead = @as(f64, @floatFromInt(fast_avg)) / @as(f64, @floatFromInt(baseline_avg));
     const parallel_speedup = @as(f64, @floatFromInt(baseline_avg)) / @as(f64, @floatFromInt(para_avg));
 
-    std.debug.print("  GitIgnore overhead: {d:.2}x (target: <1.5x)\n", .{gitignore_overhead});
-    std.debug.print("  Parallel speedup:   {d:.2}x\n", .{parallel_speedup});
+    std.debug.print("  GitIgnore overhead:             {d:.2}x (target: <1.5x)\n", .{gitignore_overhead});
+    std.debug.print("  Parallel speedup:               {d:.2}x\n", .{parallel_speedup});
 
     if (gitignore_overhead < 1.5) {
         std.debug.print("\n  ✓ GitIgnore overhead is within target!\n", .{});

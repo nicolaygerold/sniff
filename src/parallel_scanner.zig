@@ -2,7 +2,6 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const PathIndex = @import("index.zig").PathIndex;
-const GitIgnore = @import("gitignore.zig").GitIgnore;
 const ScanConfig = @import("scanner.zig").ScanConfig;
 
 /// Work item for parallel scanning
@@ -67,6 +66,7 @@ const ThreadScanner = struct {
 };
 
 /// Parallel directory scanner using work-stealing
+/// Note: Does not support gitignore (use sequential Scanner for gitignore support)
 pub const ParallelScanner = struct {
     allocator: Allocator,
     config: ScanConfig,
@@ -89,7 +89,6 @@ pub const ParallelScanner = struct {
         const num_threads = getThreadCount();
 
         if (num_threads <= 1) {
-            // Fall back to single-threaded for small jobs
             try self.scanSingleThreaded(index, root);
             return;
         }
