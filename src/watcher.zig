@@ -241,7 +241,7 @@ pub const InotifyWatcher = if (builtin.os.tag == .linux) struct {
     buf: [8192]u8 align(@alignOf(std.os.linux.inotify_event)),
 
     pub fn init(allocator: Allocator, root: []const u8) !InotifyWatcher {
-        const fd = try std.posix.inotify_init1(.{ .NONBLOCK = true });
+        const fd = try std.posix.inotify_init1(std.os.linux.IN.NONBLOCK);
 
         var self = InotifyWatcher{
             .allocator = allocator,

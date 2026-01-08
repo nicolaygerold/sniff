@@ -180,12 +180,21 @@ pub const Sniff = struct {
             const path = if (query.has_path_sep) entry.path else entry.path[entry.basename_start..];
             const path_lower = if (query.has_path_sep) entry.path_lower else entry.path_lower[entry.basename_start..];
 
-            if (self.scorer.score(query.raw, query.lower, path, path_lower)) |match| {
-                self.results.insert(.{
-                    .entry = entry,
-                    .score = match.score,
-                    .positions = match.positions.slice(),
-                });
+            // Use threshold-based scoring for early termination
+            // Once we have MAX_RESULTS, skip entries that can't beat min score
+            const threshold = if (self.results.items.len == ResultHeap.MAX_RESULTS)
+                self.results.min_score
+            else
+                std.math.minInt(i32) / 2;
+
+            if (self.scorer.scoreWithThreshold(query.raw, query.lower, path, path_lower, threshold)) |match| {
+                if (match.score > threshold) {
+                    self.results.insert(.{
+                        .entry = entry,
+                        .score = match.score,
+                        .positions = match.positions.slice(),
+                    });
+                }
             }
         }
 
