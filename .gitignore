@@ -27,3 +27,4 @@ Thumbs.db
 
 # npm packages (built during CI)
 npm/*/bin/
+.sniff-state

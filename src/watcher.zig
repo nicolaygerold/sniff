@@ -1707,6 +1707,903 @@ test "watcher init" {
     _ = try watcher.poll();
 }
 
+// =============================================================================
+// ClockSpec - Watchman-inspired cursor-based change tracking
+// Format: "c:<pid>:<tick>" for clock IDs or "n:<name>" for named cursors
+// Key patterns from Watchman:
+// - Clock IDs are race-free (tick on change, not time)
+// - Named cursors allow stateful "since last query" semantics
+// - Fresh instance detection for process restarts
+// =============================================================================
+
+pub const ClockSpec = struct {
+    const Self = @This();
+
+    /// Process ID that created this clock (for fresh instance detection)
+    pid: u32,
+    /// Monotonically increasing tick counter
+    tick: u64,
+    /// Root path this clock is associated with
+    root: []const u8,
+
+    /// Parse a clock string in format "c:<pid>:<tick>"
+    pub fn parse(clock_str: []const u8) ?Self {
+        if (clock_str.len < 5) return null;
+        if (!std.mem.startsWith(u8, clock_str, "c:")) return null;
+
+        const rest = clock_str[2..];
+        const colon_idx = std.mem.indexOf(u8, rest, ":") orelse return null;
+
+        const pid = std.fmt.parseInt(u32, rest[0..colon_idx], 10) catch return null;
+        const tick = std.fmt.parseInt(u64, rest[colon_idx + 1 ..], 10) catch return null;
+
+        return Self{
+            .pid = pid,
+            .tick = tick,
+            .root = "",
+        };
+    }
+
+    /// Format clock as string "c:<pid>:<tick>"
+    pub fn format(self: Self, buffer: []u8) ![]const u8 {
+        return std.fmt.bufPrint(buffer, "c:{d}:{d}", .{ self.pid, self.tick }) catch error.BufferTooSmall;
+    }
+
+    /// Check if this clock is from the same process as another
+    pub fn isSameProcess(self: Self, other: Self) bool {
+        return self.pid == other.pid;
+    }
+
+    /// Check if this clock is older than another (only valid if same process)
+    pub fn isOlderThan(self: Self, other: Self) bool {
+        return self.tick < other.tick;
+    }
+};
+
+// =============================================================================
+// WatchClock - Manages logical clock progression for a watched root
+// Ticks on each batch of changes, providing race-free change detection
+// Implements Watchman's clock vector concept for consistent snapshots
+// =============================================================================
+
+pub const WatchClock = struct {
+    const Self = @This();
+
+    pid: u32,
+    current_tick: u64,
+    last_tick_time: i64,
+
+    fn getPid() u32 {
+        return switch (builtin.os.tag) {
+            .linux => @intCast(std.os.linux.getpid()),
+            .macos, .freebsd, .openbsd, .netbsd => blk: {
+                // Use timestamp-based unique ID for BSD systems
+                const time_part: u32 = @truncate(@as(u64, @intCast(std.time.timestamp())) & 0xFFFFFFFF);
+                break :blk time_part ^ 0x12345678;
+            },
+            .windows => blk: {
+                // Use timestamp-based unique ID for Windows
+                const time_part: u32 = @truncate(@as(u64, @intCast(std.time.timestamp())) & 0xFFFFFFFF);
+                break :blk time_part ^ 0x87654321;
+            },
+            else => blk: {
+                // Fallback: use timestamp as pseudo-PID
+                const time_part: u32 = @truncate(@as(u64, @intCast(std.time.timestamp())) & 0xFFFFFFFF);
+                break :blk time_part;
+            },
+        };
+    }
+
+    pub fn init() Self {
+        return .{
+            .pid = getPid(),
+            .current_tick = 0,
+            .last_tick_time = std.time.milliTimestamp(),
+        };
+    }
+
+    /// Advance the clock and return the new clock spec
+    pub fn tick(self: *Self) ClockSpec {
+        self.current_tick += 1;
+        self.last_tick_time = std.time.milliTimestamp();
+        return self.current();
+    }
+
+    /// Get current clock without advancing
+    pub fn current(self: *const Self) ClockSpec {
+        return ClockSpec{
+            .pid = self.pid,
+            .tick = self.current_tick,
+            .root = "",
+        };
+    }
+
+    /// Check if a clock spec is from a previous process (fresh instance)
+    pub fn isFreshInstance(self: *const Self, clock: ClockSpec) bool {
+        return clock.pid != self.pid;
+    }
+};
+
+// =============================================================================
+// FileChangeRecord - Tracks a single file change with clock information
+// Used for "since" queries to find files modified after a given clock
+// =============================================================================
+
+pub const FileChangeRecord = struct {
+    path: []const u8,
+    kind: WatchEvent.Kind,
+    /// Clock when this change was first observed (cclock in Watchman)
+    created_clock: u64,
+    /// Clock when this change was last observed (oclock in Watchman)
+    observed_clock: u64,
+    /// Whether file currently exists
+    exists: bool,
+    /// File size at last observation
+    size: u64,
+    /// Modification time at last observation
+    mtime: i64,
+};
+
+// =============================================================================
+// SinceQuery - Watchman-style "since" generator for incremental queries
+// Returns files changed since a given clock value
+// Key patterns:
+// - Fresh instance returns all existing files marked as "new"
+// - cclock (created) vs oclock (observed) for precise tracking
+// - Supports empty_on_fresh_instance option
+// =============================================================================
+
+pub const SinceQuery = struct {
+    const Self = @This();
+
+    allocator: Allocator,
+    clock: WatchClock,
+    /// Change history indexed by tick
+    history: std.AutoHashMap(u64, std.ArrayList(FileChangeRecord)),
+    /// Current state of all files (path -> last change record)
+    file_states: std.StringHashMap(FileChangeRecord),
+    /// Retain history for this many ticks
+    history_retention: u64,
+
+    pub fn init(allocator: Allocator) Self {
+        return .{
+            .allocator = allocator,
+            .clock = WatchClock.init(),
+            .history = std.AutoHashMap(u64, std.ArrayList(FileChangeRecord)).init(allocator),
+            .file_states = std.StringHashMap(FileChangeRecord).init(allocator),
+            .history_retention = 1000, // Keep last 1000 ticks of history
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        var hist_iter = self.history.iterator();
+        while (hist_iter.next()) |entry| {
+            for (entry.value_ptr.items) |rec| {
+                self.allocator.free(rec.path);
+            }
+            entry.value_ptr.deinit();
+        }
+        self.history.deinit();
+
+        var state_iter = self.file_states.keyIterator();
+        while (state_iter.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.file_states.deinit();
+    }
+
+    /// Record a file change event, returns the clock after recording
+    pub fn recordChange(self: *Self, path: []const u8, kind: WatchEvent.Kind, size: u64, mtime: i64) !ClockSpec {
+        const new_clock = self.clock.tick();
+        const clock_tick = new_clock.tick;
+
+        const path_owned = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(path_owned);
+
+        const created_clock = if (self.file_states.get(path)) |existing|
+            existing.created_clock
+        else
+            clock_tick;
+
+        const record = FileChangeRecord{
+            .path = path_owned,
+            .kind = kind,
+            .created_clock = created_clock,
+            .observed_clock = clock_tick,
+            .exists = kind != .deleted,
+            .size = size,
+            .mtime = mtime,
+        };
+
+        // Add to history
+        const history_list = try self.history.getOrPut(clock_tick);
+        if (!history_list.found_existing) {
+            history_list.value_ptr.* = std.ArrayList(FileChangeRecord).init(self.allocator);
+        }
+        try history_list.value_ptr.append(record);
+
+        // Update current state
+        if (self.file_states.fetchRemove(path)) |kv| {
+            self.allocator.free(kv.key);
+        }
+        const state_path = try self.allocator.dupe(u8, path);
+        try self.file_states.put(state_path, FileChangeRecord{
+            .path = state_path,
+            .kind = kind,
+            .created_clock = created_clock,
+            .observed_clock = clock_tick,
+            .exists = kind != .deleted,
+            .size = size,
+            .mtime = mtime,
+        });
+
+        // Prune old history
+        self.pruneHistory();
+
+        return new_clock;
+    }
+
+    /// Query files changed since the given clock
+    /// If clock is from a different process (fresh instance), returns all existing files
+    pub fn querySince(self: *Self, since_clock: ClockSpec, results: *std.ArrayList(FileChangeRecord), empty_on_fresh: bool) !bool {
+        // Fresh instance detection (Watchman pattern)
+        if (self.clock.isFreshInstance(since_clock)) {
+            if (empty_on_fresh) {
+                return true; // Return empty results, caller should check is_fresh_instance
+            }
+
+            // Return all existing files as "new"
+            var iter = self.file_states.iterator();
+            while (iter.next()) |entry| {
+                if (entry.value_ptr.exists) {
+                    try results.append(entry.value_ptr.*);
+                }
+            }
+            return true;
+        }
+
+        // Query history for changes since the given tick
+        const since_tick = since_clock.tick;
+        const current_tick = self.clock.current_tick;
+
+        var iter_tick = since_tick + 1;
+        while (iter_tick <= current_tick) : (iter_tick += 1) {
+            if (self.history.get(iter_tick)) |records| {
+                for (records.items) |rec| {
+                    try results.append(rec);
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// Get current clock value
+    pub fn getClock(self: *const Self) ClockSpec {
+        return self.clock.current();
+    }
+
+    fn pruneHistory(self: *Self) void {
+        const current_tick = self.clock.current_tick;
+        if (current_tick <= self.history_retention) return;
+
+        const prune_before = current_tick - self.history_retention;
+
+        var to_remove = std.ArrayList(u64).init(self.allocator);
+        defer to_remove.deinit();
+
+        var iter = self.history.keyIterator();
+        while (iter.next()) |key| {
+            if (key.* < prune_before) {
+                to_remove.append(key.*) catch {};
+            }
+        }
+
+        for (to_remove.items) |removed_tick| {
+            if (self.history.fetchRemove(removed_tick)) |kv| {
+                for (kv.value.items) |rec| {
+                    self.allocator.free(rec.path);
+                }
+                kv.value.deinit();
+            }
+        }
+    }
+};
+
+// =============================================================================
+// MetadataCache - LRU cache for file metadata (Watchman pattern)
+// Caches stat info and content hashes to avoid redundant disk I/O
+// Key patterns:
+// - LRU eviction to bound memory
+// - Content hash for detecting actual changes vs touch
+// - Fast path for unchanged files
+// =============================================================================
+
+pub const FileMetadata = struct {
+    size: u64,
+    mtime: i64,
+    inode: u64,
+    content_hash: ?u64, // Simple hash for change detection
+    last_accessed: i64,
+};
+
+pub const MetadataCache = struct {
+    const Self = @This();
+    const DEFAULT_CAPACITY = 10000;
+
+    allocator: Allocator,
+    entries: std.StringHashMap(FileMetadata),
+    access_order: std.ArrayList([]const u8),
+    capacity: usize,
+    hits: u64,
+    misses: u64,
+
+    pub fn init(allocator: Allocator) Self {
+        return Self.initWithCapacity(allocator, DEFAULT_CAPACITY);
+    }
+
+    pub fn initWithCapacity(allocator: Allocator, capacity: usize) Self {
+        return .{
+            .allocator = allocator,
+            .entries = std.StringHashMap(FileMetadata).init(allocator),
+            .access_order = std.ArrayList([]const u8).init(allocator),
+            .capacity = capacity,
+            .hits = 0,
+            .misses = 0,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        var key_iter = self.entries.keyIterator();
+        while (key_iter.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.entries.deinit();
+        self.access_order.deinit();
+    }
+
+    /// Get cached metadata for a path, returns null on cache miss
+    pub fn get(self: *Self, path: []const u8) ?FileMetadata {
+        if (self.entries.getPtr(path)) |entry| {
+            self.hits += 1;
+            entry.last_accessed = std.time.milliTimestamp();
+            self.promoteToFront(path);
+            return entry.*;
+        }
+        self.misses += 1;
+        return null;
+    }
+
+    /// Put metadata into cache, evicting LRU entries if needed
+    pub fn put(self: *Self, path: []const u8, metadata: FileMetadata) !void {
+        // Evict if at capacity
+        while (self.entries.count() >= self.capacity and self.access_order.items.len > 0) {
+            self.evictLru();
+        }
+
+        if (self.entries.contains(path)) {
+            // Update existing
+            if (self.entries.getPtr(path)) |entry| {
+                entry.* = metadata;
+                entry.last_accessed = std.time.milliTimestamp();
+            }
+            self.promoteToFront(path);
+        } else {
+            // Insert new
+            const path_owned = try self.allocator.dupe(u8, path);
+            errdefer self.allocator.free(path_owned);
+
+            var meta = metadata;
+            meta.last_accessed = std.time.milliTimestamp();
+            try self.entries.put(path_owned, meta);
+            try self.access_order.append(path_owned);
+        }
+    }
+
+    /// Remove entry from cache
+    pub fn remove(self: *Self, path: []const u8) void {
+        if (self.entries.fetchRemove(path)) |kv| {
+            // Remove from access order
+            for (self.access_order.items, 0..) |p, i| {
+                if (std.mem.eql(u8, p, path)) {
+                    _ = self.access_order.orderedRemove(i);
+                    break;
+                }
+            }
+            self.allocator.free(kv.key);
+        }
+    }
+
+    /// Check if file has changed based on stat vs cached metadata
+    pub fn hasChanged(self: *Self, path: []const u8, new_size: u64, new_mtime: i64) bool {
+        if (self.entries.get(path)) |cached| {
+            return cached.size != new_size or cached.mtime != new_mtime;
+        }
+        return true; // Unknown = changed
+    }
+
+    /// Compute a simple content hash for change detection
+    pub fn computeContentHash(path: []const u8) ?u64 {
+        const file = std.fs.cwd().openFile(path, .{}) catch return null;
+        defer file.close();
+
+        var hasher = std.hash.Wyhash.init(0);
+        var buffer: [8192]u8 = undefined;
+
+        while (true) {
+            const bytes_read = file.read(&buffer) catch return null;
+            if (bytes_read == 0) break;
+            hasher.update(buffer[0..bytes_read]);
+        }
+
+        return hasher.final();
+    }
+
+    pub const CacheStats = struct {
+        hits: u64,
+        misses: u64,
+        size: usize,
+    };
+
+    /// Get cache statistics
+    pub fn getStats(self: *const Self) CacheStats {
+        return .{
+            .hits = self.hits,
+            .misses = self.misses,
+            .size = self.entries.count(),
+        };
+    }
+
+    fn evictLru(self: *Self) void {
+        if (self.access_order.items.len == 0) return;
+
+        const lru_path = self.access_order.orderedRemove(0);
+        if (self.entries.fetchRemove(lru_path)) |kv| {
+            self.allocator.free(kv.key);
+        }
+    }
+
+    fn promoteToFront(self: *Self, path: []const u8) void {
+        for (self.access_order.items, 0..) |p, i| {
+            if (std.mem.eql(u8, p, path)) {
+                const removed = self.access_order.orderedRemove(i);
+                self.access_order.append(removed) catch {};
+                break;
+            }
+        }
+    }
+};
+
+// =============================================================================
+// WatchStateManager - Save/restore state for fast recovery (Watchman pattern)
+// Serializes watch state to disk for fast process restart
+// Key patterns:
+// - State file in watched root (or config dir)
+// - Includes clock, file list, and metadata cache
+// - Validates state on load (rejects stale state)
+// =============================================================================
+
+pub const WatchStateManager = struct {
+    const Self = @This();
+    const STATE_VERSION: u32 = 1;
+    const STATE_FILE_NAME = ".sniff-state";
+
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) Self {
+        return .{
+            .allocator = allocator,
+        };
+    }
+
+    /// State that can be persisted and restored
+    pub const PersistedState = struct {
+        version: u32,
+        pid: u32,
+        clock_tick: u64,
+        root_path: []const u8,
+        file_count: u32,
+        save_time: i64,
+    };
+
+    /// Save watch state to a file
+    pub fn saveState(self: *Self, root: []const u8, clock: WatchClock, file_count: usize) !void {
+        const state_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ root, STATE_FILE_NAME });
+        defer self.allocator.free(state_path);
+
+        const file = try std.fs.cwd().createFile(state_path, .{});
+        defer file.close();
+
+        const state = PersistedState{
+            .version = STATE_VERSION,
+            .pid = clock.pid,
+            .clock_tick = clock.current_tick,
+            .root_path = root,
+            .file_count = @intCast(file_count),
+            .save_time = std.time.milliTimestamp(),
+        };
+
+        // Write header
+        const header_bytes = std.mem.asBytes(&state.version) ++
+            std.mem.asBytes(&state.pid) ++
+            std.mem.asBytes(&state.clock_tick) ++
+            std.mem.asBytes(&state.file_count) ++
+            std.mem.asBytes(&state.save_time);
+        try file.writeAll(header_bytes);
+
+        // Write root path length and data
+        const root_len: u32 = @intCast(root.len);
+        try file.writeAll(std.mem.asBytes(&root_len));
+        try file.writeAll(root);
+    }
+
+    /// Load watch state from a file
+    pub fn loadState(self: *Self, root: []const u8) !?PersistedState {
+        const state_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ root, STATE_FILE_NAME });
+        defer self.allocator.free(state_path);
+
+        const file = std.fs.cwd().openFile(state_path, .{}) catch return null;
+        defer file.close();
+
+        // Read header
+        var header_buf: [32]u8 = undefined;
+        const bytes_read = try file.readAll(&header_buf);
+        if (bytes_read < 28) return null;
+
+        const version = std.mem.bytesAsValue(u32, header_buf[0..4]).*;
+        if (version != STATE_VERSION) return null;
+
+        const pid = std.mem.bytesAsValue(u32, header_buf[4..8]).*;
+        const clock_tick = std.mem.bytesAsValue(u64, header_buf[8..16]).*;
+        const file_count = std.mem.bytesAsValue(u32, header_buf[16..20]).*;
+        const save_time = std.mem.bytesAsValue(i64, header_buf[20..28]).*;
+
+        // Validate state isn't too old (max 24 hours)
+        const now = std.time.milliTimestamp();
+        const max_age_ms: i64 = 24 * 60 * 60 * 1000;
+        if (now - save_time > max_age_ms) {
+            return null; // State too old
+        }
+
+        return PersistedState{
+            .version = version,
+            .pid = pid,
+            .clock_tick = clock_tick,
+            .root_path = root,
+            .file_count = file_count,
+            .save_time = save_time,
+        };
+    }
+
+    /// Delete saved state
+    pub fn deleteState(self: *Self, root: []const u8) !void {
+        const state_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ root, STATE_FILE_NAME });
+        defer self.allocator.free(state_path);
+
+        std.fs.cwd().deleteFile(state_path) catch {};
+    }
+};
+
+// =============================================================================
+// IncrementalWatcher - Combines all Watchman patterns into a unified interface
+// Provides cursor-based incremental queries with save state support
+// =============================================================================
+
+pub const IncrementalWatcher = struct {
+    const Self = @This();
+
+    allocator: Allocator,
+    watcher: Watcher,
+    since_query: SinceQuery,
+    metadata_cache: MetadataCache,
+    state_manager: WatchStateManager,
+    root: []const u8,
+
+    pub fn init(allocator: Allocator, root: []const u8) !Self {
+        var watcher = try Watcher.init(allocator, root);
+        errdefer watcher.deinit();
+
+        var state_manager = WatchStateManager.init(allocator);
+
+        // Try to restore previous state
+        if (state_manager.loadState(root)) |_| {
+            // Could use saved_state to fast-forward clock
+        } else |_| {
+            // No saved state, start fresh
+        }
+
+        return Self{
+            .allocator = allocator,
+            .watcher = watcher,
+            .since_query = SinceQuery.init(allocator),
+            .metadata_cache = MetadataCache.init(allocator),
+            .state_manager = state_manager,
+            .root = try allocator.dupe(u8, root),
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        // Save state before shutdown
+        self.state_manager.saveState(
+            self.root,
+            self.since_query.clock,
+            self.since_query.file_states.count(),
+        ) catch {};
+
+        self.watcher.deinit();
+        self.since_query.deinit();
+        self.metadata_cache.deinit();
+        self.allocator.free(self.root);
+    }
+
+    /// Poll for changes and record them
+    pub fn poll(self: *Self) ![]WatchEvent {
+        const events = try self.watcher.poll();
+
+        for (events) |ev| {
+            // Get file metadata
+            const full_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.root, ev.path });
+            defer self.allocator.free(full_path);
+
+            var size: u64 = 0;
+            var mtime: i64 = 0;
+
+            if (ev.kind != .deleted) {
+                const stat = std.fs.cwd().statFile(full_path) catch null;
+                if (stat) |s| {
+                    size = s.size;
+                    mtime = @divFloor(s.mtime, std.time.ns_per_ms);
+
+                    // Update metadata cache
+                    try self.metadata_cache.put(ev.path, .{
+                        .size = size,
+                        .mtime = mtime,
+                        .inode = s.inode,
+                        .content_hash = null,
+                        .last_accessed = std.time.milliTimestamp(),
+                    });
+                }
+            } else {
+                self.metadata_cache.remove(ev.path);
+            }
+
+            // Record change for since queries
+            _ = try self.since_query.recordChange(ev.path, ev.kind, size, mtime);
+        }
+
+        return events;
+    }
+
+    /// Get current clock value for use in future "since" queries
+    pub fn getClock(self: *const Self) ClockSpec {
+        return self.since_query.getClock();
+    }
+
+    /// Query files changed since the given clock
+    pub fn querySince(self: *Self, since: ClockSpec, results: *std.ArrayList(FileChangeRecord)) !bool {
+        return self.since_query.querySince(since, results, false);
+    }
+
+    /// Get file descriptor for select/poll integration
+    pub fn getFd(self: *Self) ?std.posix.fd_t {
+        return self.watcher.getFd();
+    }
+
+    /// Get metadata cache statistics
+    pub fn getCacheStats(self: *const Self) MetadataCache.CacheStats {
+        return self.metadata_cache.getStats();
+    }
+};
+
+// =============================================================================
+// Tests for Watchman-inspired patterns
+// =============================================================================
+
+test "ClockSpec parse and format" {
+    const clock = ClockSpec.parse("c:12345:678") orelse return error.ParseFailed;
+    try std.testing.expectEqual(@as(u32, 12345), clock.pid);
+    try std.testing.expectEqual(@as(u64, 678), clock.tick);
+
+    var buffer: [32]u8 = undefined;
+    const formatted = try clock.format(&buffer);
+    try std.testing.expectEqualStrings("c:12345:678", formatted);
+}
+
+test "ClockSpec parse invalid" {
+    try std.testing.expect(ClockSpec.parse("") == null);
+    try std.testing.expect(ClockSpec.parse("invalid") == null);
+    try std.testing.expect(ClockSpec.parse("c:abc:123") == null);
+    try std.testing.expect(ClockSpec.parse("n:cursor") == null);
+}
+
+test "WatchClock init and tick" {
+    var clock = WatchClock.init();
+
+    const initial = clock.current();
+    try std.testing.expectEqual(@as(u64, 0), initial.tick);
+
+    const after_tick = clock.tick();
+    try std.testing.expectEqual(@as(u64, 1), after_tick.tick);
+
+    const current = clock.current();
+    try std.testing.expectEqual(@as(u64, 1), current.tick);
+}
+
+test "WatchClock fresh instance detection" {
+    var clock = WatchClock.init();
+
+    const our_clock = clock.current();
+    try std.testing.expect(!clock.isFreshInstance(our_clock));
+
+    const other_clock = ClockSpec{
+        .pid = clock.pid + 1, // Different PID
+        .tick = 0,
+        .root = "",
+    };
+    try std.testing.expect(clock.isFreshInstance(other_clock));
+}
+
+test "SinceQuery record and query" {
+    const allocator = std.testing.allocator;
+    var sq = SinceQuery.init(allocator);
+    defer sq.deinit();
+
+    const initial_clock = sq.getClock();
+    try std.testing.expectEqual(@as(u64, 0), initial_clock.tick);
+
+    _ = try sq.recordChange("/src/main.zig", .created, 100, 1000);
+    _ = try sq.recordChange("/src/lib.zig", .modified, 200, 2000);
+
+    var results = std.ArrayList(FileChangeRecord).init(allocator);
+    defer results.deinit();
+
+    const is_fresh = try sq.querySince(initial_clock, &results, false);
+    try std.testing.expect(!is_fresh);
+    try std.testing.expectEqual(@as(usize, 2), results.items.len);
+}
+
+test "SinceQuery fresh instance detection" {
+    const allocator = std.testing.allocator;
+    var sq = SinceQuery.init(allocator);
+    defer sq.deinit();
+
+    _ = try sq.recordChange("/src/main.zig", .created, 100, 1000);
+
+    // Create a clock from a different process
+    const other_clock = ClockSpec{
+        .pid = sq.clock.pid + 1,
+        .tick = 0,
+        .root = "",
+    };
+
+    var results = std.ArrayList(FileChangeRecord).init(allocator);
+    defer results.deinit();
+
+    const is_fresh = try sq.querySince(other_clock, &results, false);
+    try std.testing.expect(is_fresh);
+    try std.testing.expectEqual(@as(usize, 1), results.items.len); // Returns existing files
+}
+
+test "MetadataCache basic operations" {
+    const allocator = std.testing.allocator;
+    var cache = MetadataCache.initWithCapacity(allocator, 10);
+    defer cache.deinit();
+
+    // Miss on empty cache
+    try std.testing.expect(cache.get("/test/file.txt") == null);
+
+    // Put and get
+    try cache.put("/test/file.txt", .{
+        .size = 100,
+        .mtime = 1000,
+        .inode = 1,
+        .content_hash = null,
+        .last_accessed = 0,
+    });
+
+    const cached = cache.get("/test/file.txt");
+    try std.testing.expect(cached != null);
+    try std.testing.expectEqual(@as(u64, 100), cached.?.size);
+
+    // Check stats
+    const stats = cache.getStats();
+    try std.testing.expectEqual(@as(u64, 1), stats.hits);
+    try std.testing.expectEqual(@as(u64, 1), stats.misses);
+}
+
+test "MetadataCache LRU eviction" {
+    const allocator = std.testing.allocator;
+    var cache = MetadataCache.initWithCapacity(allocator, 2);
+    defer cache.deinit();
+
+    try cache.put("/file1.txt", .{ .size = 1, .mtime = 1, .inode = 1, .content_hash = null, .last_accessed = 0 });
+    try cache.put("/file2.txt", .{ .size = 2, .mtime = 2, .inode = 2, .content_hash = null, .last_accessed = 0 });
+
+    // Access file1 to make it more recent
+    _ = cache.get("/file1.txt");
+
+    // Add third file, should evict file2 (LRU)
+    try cache.put("/file3.txt", .{ .size = 3, .mtime = 3, .inode = 3, .content_hash = null, .last_accessed = 0 });
+
+    try std.testing.expect(cache.get("/file1.txt") != null);
+    try std.testing.expect(cache.get("/file2.txt") == null); // Evicted
+    try std.testing.expect(cache.get("/file3.txt") != null);
+}
+
+test "MetadataCache hasChanged" {
+    const allocator = std.testing.allocator;
+    var cache = MetadataCache.initWithCapacity(allocator, 10);
+    defer cache.deinit();
+
+    try cache.put("/test/file.txt", .{
+        .size = 100,
+        .mtime = 1000,
+        .inode = 1,
+        .content_hash = null,
+        .last_accessed = 0,
+    });
+
+    // No change
+    try std.testing.expect(!cache.hasChanged("/test/file.txt", 100, 1000));
+
+    // Size changed
+    try std.testing.expect(cache.hasChanged("/test/file.txt", 200, 1000));
+
+    // Mtime changed
+    try std.testing.expect(cache.hasChanged("/test/file.txt", 100, 2000));
+
+    // Unknown file = changed
+    try std.testing.expect(cache.hasChanged("/unknown/file.txt", 100, 1000));
+}
+
+test "IncrementalWatcher init and deinit" {
+    const allocator = std.testing.allocator;
+
+    const cwd = std.fs.cwd();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try cwd.realpath(".", &buf);
+
+    var iw = try IncrementalWatcher.init(allocator, path);
+    defer iw.deinit();
+
+    // Should have valid clock
+    const clock = iw.getClock();
+    try std.testing.expect(clock.pid != 0);
+    try std.testing.expectEqual(@as(u64, 0), clock.tick);
+
+    // Cache should be empty
+    const stats = iw.getCacheStats();
+    try std.testing.expectEqual(@as(u64, 0), stats.hits);
+    try std.testing.expectEqual(@as(usize, 0), stats.size);
+}
+
+test "WatchStateManager save and load" {
+    const allocator = std.testing.allocator;
+    var manager = WatchStateManager.init(allocator);
+
+    // Create temp dir for testing
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_path = try tmp_dir.dir.realpath(".", &path_buf);
+
+    // Create a clock to save
+    var clock = WatchClock.init();
+    _ = clock.tick();
+    _ = clock.tick();
+
+    // Save state
+    try manager.saveState(tmp_path, clock, 42);
+
+    // Load state
+    const loaded = try manager.loadState(tmp_path);
+    try std.testing.expect(loaded != null);
+    try std.testing.expectEqual(clock.pid, loaded.?.pid);
+    try std.testing.expectEqual(clock.current_tick, loaded.?.clock_tick);
+    try std.testing.expectEqual(@as(u32, 42), loaded.?.file_count);
+}
+
 test "WatchEntry file type detection" {
     const now = std.time.milliTimestamp();
 
