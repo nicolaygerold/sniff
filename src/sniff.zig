@@ -198,7 +198,49 @@ pub const Sniff = struct {
             }
         }
 
-        return self.results.getSorted();
+        const sorted = self.results.getSorted();
+
+        // Lazy validation: verify top results still exist on disk
+        // This handles stale cache entries for deleted files
+        return self.validateResults(sorted);
+    }
+
+    /// Validate that result files still exist, removing stale entries
+    /// Only checks files we're about to return, not the entire index
+    fn validateResults(self: *Sniff, results: []SearchResult) []SearchResult {
+        const root = self.root_path orelse return results;
+
+        var stale_paths = std.ArrayList([]const u8).init(self.allocator);
+        defer stale_paths.deinit();
+
+        var valid_count: usize = 0;
+        for (results) |*result| {
+            const full_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ root, result.entry.path }) catch {
+                // On alloc failure, keep the result
+                results[valid_count] = result.*;
+                valid_count += 1;
+                continue;
+            };
+            defer self.allocator.free(full_path);
+
+            // Quick existence check via access()
+            std.fs.cwd().access(full_path, .{}) catch {
+                // File doesn't exist - mark for removal from index
+                stale_paths.append(result.entry.path) catch {};
+                continue;
+            };
+
+            // File exists - keep in results
+            results[valid_count] = result.*;
+            valid_count += 1;
+        }
+
+        // Remove stale entries from index (deferred to avoid iterator invalidation)
+        for (stale_paths.items) |path| {
+            self.index.removePath(path);
+        }
+
+        return results[0..valid_count];
     }
 
     pub fn clear(self: *Sniff) void {
@@ -252,4 +294,25 @@ test "sniff with cache disabled" {
 
     try std.testing.expect(sniff.cache == null);
     try std.testing.expect(sniff.watcher == null);
+}
+
+test "sniff lazy validation removes stale entries" {
+    const allocator = std.testing.allocator;
+
+    var sniff = Sniff.init(allocator, .{ .use_cache = false, .use_watcher = false });
+    defer sniff.deinit();
+
+    // Add a path that doesn't exist
+    try sniff.index.addPath("nonexistent/file.txt");
+    try std.testing.expectEqual(@as(usize, 1), sniff.fileCount());
+
+    // Set root path so validation runs
+    sniff.root_path = try allocator.dupe(u8, "/tmp");
+
+    // Search should trigger validation and remove stale entry
+    const results = sniff.search("file");
+    try std.testing.expectEqual(@as(usize, 0), results.len);
+
+    // Stale entry should be removed from index
+    try std.testing.expectEqual(@as(usize, 0), sniff.fileCount());
 }
