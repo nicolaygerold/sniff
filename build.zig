@@ -84,12 +84,19 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const watcher_tests = b.addTest(.{
+        .root_source_file = b.path("src/watcher.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const run_index_tests = b.addRunArtifact(index_tests);
     const run_results_tests = b.addRunArtifact(results_tests);
     const run_scanner_tests = b.addRunArtifact(scanner_tests);
     const run_query_tests = b.addRunArtifact(query_tests);
     const run_scorer_tests = b.addRunArtifact(scorer_tests);
     const run_gitignore_tests = b.addRunArtifact(gitignore_tests);
+    const run_watcher_tests = b.addRunArtifact(watcher_tests);
 
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_index_tests.step);
@@ -98,4 +105,5 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_query_tests.step);
     test_step.dependOn(&run_scorer_tests.step);
     test_step.dependOn(&run_gitignore_tests.step);
+    test_step.dependOn(&run_watcher_tests.step);
 }

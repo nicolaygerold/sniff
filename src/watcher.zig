@@ -130,13 +130,113 @@ pub fn RenameCookieBuffer(comptime T: type) type {
 }
 
 // =============================================================================
-// Debounce state for per-path event coalescing
+// FileIdCache for tracking file identity across renames (notify-rs pattern)
+// Used on macOS/Windows where rename cookies are not available
+// On Linux, inotify provides rename cookies so FileID tracking is optional
+// =============================================================================
+
+pub const FileId = struct {
+    inode: u64,
+
+    pub fn eql(self: FileId, other: FileId) bool {
+        return self.inode == other.inode;
+    }
+};
+
+pub const FileIdCache = struct {
+    const Self = @This();
+
+    paths: std.StringHashMap(FileId),
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) Self {
+        return .{
+            .paths = std.StringHashMap(FileId).init(allocator),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        var key_iter = self.paths.keyIterator();
+        while (key_iter.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.paths.deinit();
+    }
+
+    pub fn getFileId(path: []const u8) ?FileId {
+        const stat = std.fs.cwd().statFile(path) catch return null;
+        return FileId{
+            .inode = stat.inode,
+        };
+    }
+
+    pub fn cachedFileId(self: *const Self, path: []const u8) ?FileId {
+        return self.paths.get(path);
+    }
+
+    pub fn addPath(self: *Self, path: []const u8) !void {
+        if (getFileId(path)) |file_id| {
+            if (!self.paths.contains(path)) {
+                const path_owned = try self.allocator.dupe(u8, path);
+                try self.paths.put(path_owned, file_id);
+            } else {
+                if (self.paths.getPtr(path)) |entry| {
+                    entry.* = file_id;
+                }
+            }
+        }
+    }
+
+    pub fn removePath(self: *Self, path: []const u8) void {
+        if (self.paths.fetchRemove(path)) |kv| {
+            self.allocator.free(kv.key);
+        }
+    }
+
+    pub fn removePathsWithPrefix(self: *Self, prefix: []const u8) void {
+        var to_remove = std.ArrayList([]const u8).init(self.allocator);
+        defer to_remove.deinit();
+
+        var key_iter = self.paths.keyIterator();
+        while (key_iter.next()) |key| {
+            if (std.mem.startsWith(u8, key.*, prefix)) {
+                to_remove.append(key.*) catch {};
+            }
+        }
+
+        for (to_remove.items) |key| {
+            if (self.paths.fetchRemove(key)) |kv| {
+                self.allocator.free(kv.key);
+            }
+        }
+    }
+
+    pub fn findByFileId(self: *const Self, file_id: FileId) ?[]const u8 {
+        var iter = self.paths.iterator();
+        while (iter.next()) |entry| {
+            if (entry.value_ptr.eql(file_id)) {
+                return entry.key_ptr.*;
+            }
+        }
+        return null;
+    }
+};
+
+// =============================================================================
+// Debounce state for per-path event coalescing (notify-rs patterns)
+// Key patterns from notify-debouncer-full:
+// - Skip duplicate Create events
+// - Suppress Modify after Create
+// - Per-path event queuing with time-based expiration
 // =============================================================================
 
 pub const DebounceEntry = struct {
     kind: WatchEvent.Kind,
+    first_event: i64,
     last_event: i64,
     event_count: u32,
+    was_created: bool,
 };
 
 pub fn Debouncer(comptime debounce_ms: i64) type {
@@ -165,15 +265,37 @@ pub fn Debouncer(comptime debounce_ms: i64) type {
             const now = std.time.milliTimestamp();
 
             if (self.pending.getPtr(path)) |entry| {
-                entry.kind = mergeEventKinds(entry.kind, kind);
+                // notify-rs pattern: Skip duplicate Create and Modify after Create
+                if (entry.was_created) {
+                    switch (kind) {
+                        .created => return, // Skip duplicate Create
+                        .modified => return, // Suppress Modify after Create
+                        .deleted => {
+                            // created + deleted = deleted (file never really existed)
+                            entry.kind = .deleted;
+                            entry.was_created = false;
+                        },
+                        .renamed => {
+                            // Keep rename, update state
+                            entry.kind = kind;
+                        },
+                    }
+                } else {
+                    entry.kind = mergeEventKinds(entry.kind, kind);
+                    if (kind == .created) {
+                        entry.was_created = true;
+                    }
+                }
                 entry.last_event = now;
                 entry.event_count += 1;
             } else {
                 const path_owned = try self.allocator.dupe(u8, path);
                 try self.pending.put(path_owned, .{
                     .kind = kind,
+                    .first_event = now,
                     .last_event = now,
                     .event_count = 1,
+                    .was_created = kind == .created,
                 });
             }
         }
@@ -221,6 +343,16 @@ pub const KqueueWatcher = struct {
     events: std.ArrayList(WatchEvent),
     root: []const u8,
     debouncer: Debouncer(50),
+    file_id_cache: FileIdCache,
+    pending_rename: ?PendingRename,
+
+    const PendingRename = struct {
+        path: []const u8,
+        file_id: ?FileId,
+        timestamp: i64,
+    };
+
+    const RENAME_TIMEOUT_MS: i64 = 500;
 
     pub fn init(allocator: Allocator, root: []const u8) !KqueueWatcher {
         const kq = try std.posix.kqueue();
@@ -233,6 +365,8 @@ pub const KqueueWatcher = struct {
             .events = std.ArrayList(WatchEvent).init(allocator),
             .root = try allocator.dupe(u8, root),
             .debouncer = Debouncer(50).init(allocator),
+            .file_id_cache = FileIdCache.init(allocator),
+            .pending_rename = null,
         };
 
         try self.watchDirRecursive(root, 0);
@@ -254,6 +388,10 @@ pub const KqueueWatcher = struct {
 
         self.events.deinit();
         self.debouncer.deinit();
+        self.file_id_cache.deinit();
+        if (self.pending_rename) |pr| {
+            self.allocator.free(pr.path);
+        }
         std.posix.close(self.kq);
         self.allocator.free(self.root);
     }
@@ -304,6 +442,17 @@ pub const KqueueWatcher = struct {
     pub fn poll(self: *KqueueWatcher) ![]WatchEvent {
         self.events.clearRetainingCapacity();
 
+        // Expire pending rename if too old
+        if (self.pending_rename) |pr| {
+            const now = std.time.milliTimestamp();
+            if (now - pr.timestamp > RENAME_TIMEOUT_MS) {
+                try self.debouncer.recordEvent(pr.path, .deleted);
+                self.file_id_cache.removePath(pr.path);
+                self.allocator.free(pr.path);
+                self.pending_rename = null;
+            }
+        }
+
         var eventlist: [64]std.posix.Kevent = undefined;
         const timeout = std.posix.timespec{ .tv_sec = 0, .tv_nsec = 0 };
 
@@ -321,11 +470,15 @@ pub const KqueueWatcher = struct {
 
             if (ev.fflags & c.NOTE_DELETE != 0) {
                 try self.debouncer.recordEvent(path, .deleted);
+                self.file_id_cache.removePath(path);
                 _ = self.watched_fds.remove(path);
                 _ = self.fd_to_path.remove(fd);
                 std.posix.close(fd);
             } else if (ev.fflags & c.NOTE_RENAME != 0) {
-                try self.debouncer.recordEvent(path, .renamed);
+                // FileID-based rename stitching (notify-rs pattern)
+                // NOTE_RENAME on kqueue means a file at this fd was renamed
+                // We need to find where it went by checking FileID
+                try self.handleRename(path);
             } else if (ev.fflags & (c.NOTE_WRITE | c.NOTE_EXTEND) != 0) {
                 try self.debouncer.recordEvent(path, .modified);
                 try self.watchNewSubdirs(path);
@@ -334,6 +487,62 @@ pub const KqueueWatcher = struct {
 
         try self.debouncer.collectReady(&self.events);
         return self.events.items;
+    }
+
+    fn handleRename(self: *KqueueWatcher, old_path: []const u8) !void {
+        // Get the FileID before the rename (if cached)
+        const old_file_id = self.file_id_cache.cachedFileId(old_path);
+
+        // Try to find the new path by scanning the parent directory
+        // and looking for a file with the same inode
+        if (old_file_id) |file_id| {
+            if (self.findNewPathByFileId(old_path, file_id)) |new_path| {
+                // Found the new path - emit rename event for old path, created for new
+                try self.debouncer.recordEvent(old_path, .renamed);
+                try self.debouncer.recordEvent(new_path, .created);
+
+                // Update cache
+                self.file_id_cache.removePath(old_path);
+                try self.file_id_cache.addPath(new_path);
+                self.allocator.free(new_path);
+                return;
+            }
+        }
+
+        // Could not find new path - treat as simple rename
+        try self.debouncer.recordEvent(old_path, .renamed);
+        self.file_id_cache.removePath(old_path);
+    }
+
+    fn findNewPathByFileId(self: *KqueueWatcher, old_path: []const u8, target_file_id: FileId) ?[]const u8 {
+        // Get the parent directory
+        const last_sep = std.mem.lastIndexOfScalar(u8, old_path, '/') orelse return null;
+        const parent_dir = if (last_sep == 0) "/" else old_path[0..last_sep];
+
+        var dir = std.fs.openDirAbsolute(parent_dir, .{ .iterate = true }) catch return null;
+        defer dir.close();
+
+        var iter = dir.iterate();
+        while (iter.next() catch return null) |entry| {
+            if (entry.name.len > 0 and entry.name[0] == '.') continue;
+
+            const full_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ parent_dir, entry.name }) catch continue;
+
+            // Check if this file has the target FileID
+            if (FileIdCache.getFileId(full_path)) |file_id| {
+                if (file_id.eql(target_file_id)) {
+                    // Skip if this is the old path
+                    if (std.mem.eql(u8, full_path, old_path)) {
+                        self.allocator.free(full_path);
+                        continue;
+                    }
+                    return full_path;
+                }
+            }
+            self.allocator.free(full_path);
+        }
+
+        return null;
     }
 
     fn watchNewSubdirs(self: *KqueueWatcher, dir_path: []const u8) !void {
@@ -708,6 +917,94 @@ test "Debouncer event merging" {
 
     try std.testing.expectEqual(@as(usize, 1), events.items.len);
     try std.testing.expectEqual(WatchEvent.Kind.created, events.items[0].kind);
+}
+
+test "Debouncer skip duplicate Create (notify-rs pattern)" {
+    const allocator = std.testing.allocator;
+    var debouncer = Debouncer(0).init(allocator);
+    defer debouncer.deinit();
+
+    try debouncer.recordEvent("/test/file.txt", .created);
+    try debouncer.recordEvent("/test/file.txt", .created);
+    try debouncer.recordEvent("/test/file.txt", .created);
+
+    var events = std.ArrayList(WatchEvent).init(allocator);
+    defer events.deinit();
+
+    try debouncer.collectReady(&events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqual(WatchEvent.Kind.created, events.items[0].kind);
+}
+
+test "Debouncer suppress Modify after Create (notify-rs pattern)" {
+    const allocator = std.testing.allocator;
+    var debouncer = Debouncer(0).init(allocator);
+    defer debouncer.deinit();
+
+    try debouncer.recordEvent("/test/file.txt", .created);
+    try debouncer.recordEvent("/test/file.txt", .modified);
+    try debouncer.recordEvent("/test/file.txt", .modified);
+    try debouncer.recordEvent("/test/file.txt", .modified);
+
+    var events = std.ArrayList(WatchEvent).init(allocator);
+    defer events.deinit();
+
+    try debouncer.collectReady(&events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqual(WatchEvent.Kind.created, events.items[0].kind);
+}
+
+test "Debouncer created + deleted = deleted" {
+    const allocator = std.testing.allocator;
+    var debouncer = Debouncer(0).init(allocator);
+    defer debouncer.deinit();
+
+    try debouncer.recordEvent("/test/file.txt", .created);
+    try debouncer.recordEvent("/test/file.txt", .deleted);
+
+    var events = std.ArrayList(WatchEvent).init(allocator);
+    defer events.deinit();
+
+    try debouncer.collectReady(&events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqual(WatchEvent.Kind.deleted, events.items[0].kind);
+}
+
+test "Debouncer modified + deleted = deleted" {
+    const allocator = std.testing.allocator;
+    var debouncer = Debouncer(0).init(allocator);
+    defer debouncer.deinit();
+
+    try debouncer.recordEvent("/test/file.txt", .modified);
+    try debouncer.recordEvent("/test/file.txt", .deleted);
+
+    var events = std.ArrayList(WatchEvent).init(allocator);
+    defer events.deinit();
+
+    try debouncer.collectReady(&events);
+
+    try std.testing.expectEqual(@as(usize, 1), events.items.len);
+    try std.testing.expectEqual(WatchEvent.Kind.deleted, events.items[0].kind);
+}
+
+test "FileIdCache basic operations" {
+    const allocator = std.testing.allocator;
+    var cache = FileIdCache.init(allocator);
+    defer cache.deinit();
+
+    try std.testing.expect(cache.cachedFileId("/nonexistent") == null);
+}
+
+test "FileId equality" {
+    const id1 = FileId{ .inode = 100 };
+    const id2 = FileId{ .inode = 100 };
+    const id3 = FileId{ .inode = 200 };
+
+    try std.testing.expect(id1.eql(id2));
+    try std.testing.expect(!id1.eql(id3));
 }
 
 test "watcher init" {
