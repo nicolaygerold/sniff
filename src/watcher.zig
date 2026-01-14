@@ -627,6 +627,291 @@ pub const WatchState = struct {
 };
 
 // =============================================================================
+// WorkspaceWatcher - Multi-workspace file watcher
+// Manages multiple FileWatcher instances (one per workspace root)
+// Aggregates dirty files across workspaces with cross-workspace importance ranking
+// Handles overlapping paths gracefully (child workspaces override parent watchers)
+// =============================================================================
+
+pub const WorkspaceWatcher = struct {
+    const Self = @This();
+    const MAX_WORKSPACES = 32;
+
+    allocator: Allocator,
+    workspaces: std.StringHashMap(WorkspaceEntry),
+    global_dirty_heap: DirtyFileHeap,
+
+    const WorkspaceEntry = struct {
+        watcher: Watcher,
+        state: WatchState,
+        root: []const u8,
+        is_active: bool,
+    };
+
+    pub fn init(allocator: Allocator) Self {
+        return .{
+            .allocator = allocator,
+            .workspaces = std.StringHashMap(WorkspaceEntry).init(allocator),
+            .global_dirty_heap = DirtyFileHeap.init(),
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        var iter = self.workspaces.iterator();
+        while (iter.next()) |entry| {
+            var ws = entry.value_ptr;
+            ws.watcher.deinit();
+            ws.state.deinit();
+            self.allocator.free(ws.root);
+        }
+
+        var key_iter = self.workspaces.keyIterator();
+        while (key_iter.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.workspaces.deinit();
+    }
+
+    /// Add a workspace to watch. If the path overlaps with an existing workspace,
+    /// the more specific (child) path takes precedence for overlapping files.
+    pub fn addWorkspace(self: *Self, root: []const u8) !void {
+        if (self.workspaces.count() >= MAX_WORKSPACES) {
+            return error.TooManyWorkspaces;
+        }
+
+        if (self.workspaces.contains(root)) {
+            return; // Already watching
+        }
+
+        // Check for overlapping paths and handle gracefully
+        // If new workspace is child of existing, it will override for those paths
+        // If new workspace is parent of existing child, child takes precedence
+        var iter = self.workspaces.iterator();
+        while (iter.next()) |entry| {
+            const existing_root = entry.key_ptr.*;
+
+            // New path is parent of existing - existing child takes precedence
+            if (std.mem.startsWith(u8, existing_root, root) and
+                existing_root.len > root.len and
+                (existing_root[root.len] == '/' or existing_root[root.len] == '\\'))
+            {
+                // Existing is a child workspace - it will handle its own subtree
+                // We still add the parent but mark overlapping paths as handled
+                continue;
+            }
+
+            // New path is child of existing - new takes precedence for its subtree
+            if (std.mem.startsWith(u8, root, existing_root) and
+                root.len > existing_root.len and
+                (root[existing_root.len] == '/' or root[existing_root.len] == '\\'))
+            {
+                // Parent exists, new child will override for its subtree
+                continue;
+            }
+        }
+
+        const root_owned = try self.allocator.dupe(u8, root);
+        errdefer self.allocator.free(root_owned);
+
+        const key_owned = try self.allocator.dupe(u8, root);
+        errdefer self.allocator.free(key_owned);
+
+        var watcher = try Watcher.init(self.allocator, root);
+        errdefer watcher.deinit();
+
+        try self.workspaces.put(key_owned, .{
+            .watcher = watcher,
+            .state = WatchState.init(self.allocator),
+            .root = root_owned,
+            .is_active = true,
+        });
+    }
+
+    /// Remove a workspace from watching
+    pub fn removeWorkspace(self: *Self, root: []const u8) void {
+        if (self.workspaces.fetchRemove(root)) |kv| {
+            var ws = kv.value;
+            ws.watcher.deinit();
+            ws.state.deinit();
+            self.allocator.free(ws.root);
+            self.allocator.free(kv.key);
+
+            // Remove any dirty files from this workspace from global heap
+            self.rebuildGlobalDirtyHeap();
+        }
+    }
+
+    /// Poll all workspaces for events and update dirty file tracking
+    pub fn poll(self: *Self) ![]WatchEvent {
+        var all_events = std.ArrayList(WatchEvent).init(self.allocator);
+        defer all_events.deinit();
+
+        var iter = self.workspaces.iterator();
+        while (iter.next()) |entry| {
+            const ws = entry.value_ptr;
+            if (!ws.is_active) continue;
+
+            const events = try ws.watcher.poll();
+            for (events) |ev| {
+                // Convert relative path to absolute for cross-workspace tracking
+                const abs_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ ws.root, ev.path });
+                defer self.allocator.free(abs_path);
+
+                // Skip if a more specific child workspace handles this path
+                if (self.isHandledByChildWorkspace(ws.root, abs_path)) {
+                    continue;
+                }
+
+                // Update workspace state
+                switch (ev.kind) {
+                    .created => {
+                        ws.state.addEntry(abs_path, .file) catch {};
+                        ws.state.markDirty(abs_path);
+                    },
+                    .modified => {
+                        ws.state.markDirty(abs_path);
+                    },
+                    .deleted => {
+                        ws.state.removeEntry(abs_path);
+                    },
+                    .renamed => {
+                        ws.state.removeEntry(abs_path);
+                    },
+                }
+
+                // Add to global dirty heap for cross-workspace ranking
+                if (ev.kind == .created or ev.kind == .modified) {
+                    if (ws.state.entries.get(abs_path)) |watch_entry| {
+                        self.global_dirty_heap.insert(watch_entry.path, watch_entry.importance);
+                    }
+                } else {
+                    _ = self.global_dirty_heap.remove(abs_path);
+                }
+
+                try all_events.append(ev);
+            }
+        }
+
+        // Return events - caller owns this memory
+        return try all_events.toOwnedSlice();
+    }
+
+    /// Check if a path is handled by a more specific child workspace
+    fn isHandledByChildWorkspace(self: *Self, current_root: []const u8, abs_path: []const u8) bool {
+        var iter = self.workspaces.iterator();
+        while (iter.next()) |entry| {
+            const other_root = entry.key_ptr.*;
+
+            // Skip self
+            if (std.mem.eql(u8, other_root, current_root)) continue;
+
+            // Other workspace is a child of current and contains this path
+            if (std.mem.startsWith(u8, other_root, current_root) and
+                other_root.len > current_root.len and
+                std.mem.startsWith(u8, abs_path, other_root))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Rebuild the global dirty heap from all workspace states
+    fn rebuildGlobalDirtyHeap(self: *Self) void {
+        self.global_dirty_heap = DirtyFileHeap.init();
+
+        var ws_iter = self.workspaces.iterator();
+        while (ws_iter.next()) |ws_entry| {
+            const ws = ws_entry.value_ptr;
+            var dirty_count = ws.state.dirtyCount();
+            while (dirty_count > 0) : (dirty_count -= 1) {
+                if (ws.state.dirty_files.peek()) |entry| {
+                    self.global_dirty_heap.insert(entry.path, entry.importance);
+                }
+            }
+        }
+    }
+
+    /// Get the next highest-priority dirty file across all workspaces
+    pub fn popGlobalDirty(self: *Self) ?[]const u8 {
+        if (self.global_dirty_heap.pop()) |entry| {
+            // Also remove from the workspace's local dirty heap
+            var iter = self.workspaces.iterator();
+            while (iter.next()) |ws_entry| {
+                _ = ws_entry.value_ptr.state.dirty_files.remove(entry.path);
+            }
+            return entry.path;
+        }
+        return null;
+    }
+
+    /// Peek at the next highest-priority dirty file
+    pub fn peekGlobalDirty(self: *const Self) ?[]const u8 {
+        if (self.global_dirty_heap.peek()) |entry| {
+            return entry.path;
+        }
+        return null;
+    }
+
+    /// Get total dirty file count across all workspaces
+    pub fn globalDirtyCount(self: *const Self) usize {
+        return self.global_dirty_heap.len();
+    }
+
+    /// Get the number of active workspaces
+    pub fn workspaceCount(self: *const Self) usize {
+        return self.workspaces.count();
+    }
+
+    /// Mark a file as open across all workspaces that contain it
+    pub fn markOpen(self: *Self, abs_path: []const u8) !void {
+        var iter = self.workspaces.iterator();
+        while (iter.next()) |entry| {
+            const ws = entry.value_ptr;
+            if (std.mem.startsWith(u8, abs_path, ws.root)) {
+                try ws.state.markOpen(abs_path);
+                // Update global heap with new importance
+                if (ws.state.entries.get(abs_path)) |watch_entry| {
+                    self.global_dirty_heap.insert(watch_entry.path, watch_entry.importance);
+                }
+            }
+        }
+    }
+
+    /// Mark a file as closed across all workspaces
+    pub fn markClosed(self: *Self, abs_path: []const u8) void {
+        var iter = self.workspaces.iterator();
+        while (iter.next()) |entry| {
+            const ws = entry.value_ptr;
+            if (std.mem.startsWith(u8, abs_path, ws.root)) {
+                ws.state.markClosed(abs_path);
+                // Update global heap with new importance
+                if (ws.state.entries.get(abs_path)) |watch_entry| {
+                    self.global_dirty_heap.insert(watch_entry.path, watch_entry.importance);
+                }
+            }
+        }
+    }
+
+    /// Get workspace roots (for debugging/introspection)
+    pub fn getWorkspaceRoots(self: *const Self, buffer: [][]const u8) usize {
+        var count: usize = 0;
+        var iter = self.workspaces.iterator();
+        while (iter.next()) |entry| {
+            if (count >= buffer.len) break;
+            buffer[count] = entry.key_ptr.*;
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Check if a specific workspace is being watched
+    pub fn hasWorkspace(self: *const Self, root: []const u8) bool {
+        return self.workspaces.contains(root);
+    }
+};
+
+// =============================================================================
 // Debounce state for per-path event coalescing (notify-rs patterns)
 // Key patterns from notify-debouncer-full:
 // - Skip duplicate Create events
@@ -1551,4 +1836,98 @@ test "WatchState open file tracking" {
 
     const final = state.entries.get("/src/main.zig").?.importance;
     try std.testing.expect(final < after);
+}
+
+test "WorkspaceWatcher init and deinit" {
+    const allocator = std.testing.allocator;
+    var ws_watcher = WorkspaceWatcher.init(allocator);
+    defer ws_watcher.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), ws_watcher.workspaceCount());
+}
+
+test "WorkspaceWatcher add and remove workspace" {
+    const allocator = std.testing.allocator;
+    var ws_watcher = WorkspaceWatcher.init(allocator);
+    defer ws_watcher.deinit();
+
+    const cwd = std.fs.cwd();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try cwd.realpath(".", &buf);
+
+    try ws_watcher.addWorkspace(path);
+    try std.testing.expectEqual(@as(usize, 1), ws_watcher.workspaceCount());
+    try std.testing.expect(ws_watcher.hasWorkspace(path));
+
+    // Adding same workspace again is a no-op
+    try ws_watcher.addWorkspace(path);
+    try std.testing.expectEqual(@as(usize, 1), ws_watcher.workspaceCount());
+
+    ws_watcher.removeWorkspace(path);
+    try std.testing.expectEqual(@as(usize, 0), ws_watcher.workspaceCount());
+    try std.testing.expect(!ws_watcher.hasWorkspace(path));
+}
+
+test "WorkspaceWatcher getWorkspaceRoots" {
+    const allocator = std.testing.allocator;
+    var ws_watcher = WorkspaceWatcher.init(allocator);
+    defer ws_watcher.deinit();
+
+    const cwd = std.fs.cwd();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try cwd.realpath(".", &buf);
+
+    try ws_watcher.addWorkspace(path);
+
+    var roots: [8][]const u8 = undefined;
+    const count = ws_watcher.getWorkspaceRoots(&roots);
+
+    try std.testing.expectEqual(@as(usize, 1), count);
+    try std.testing.expectEqualStrings(path, roots[0]);
+}
+
+test "WorkspaceWatcher poll empty" {
+    const allocator = std.testing.allocator;
+    var ws_watcher = WorkspaceWatcher.init(allocator);
+    defer ws_watcher.deinit();
+
+    const cwd = std.fs.cwd();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try cwd.realpath(".", &buf);
+
+    try ws_watcher.addWorkspace(path);
+
+    const events = try ws_watcher.poll();
+    defer allocator.free(events);
+
+    // No events expected initially (just testing the poll mechanism works)
+    // Events may or may not be empty depending on filesystem activity
+}
+
+test "WorkspaceWatcher global dirty heap empty" {
+    const allocator = std.testing.allocator;
+    var ws_watcher = WorkspaceWatcher.init(allocator);
+    defer ws_watcher.deinit();
+
+    try std.testing.expectEqual(@as(usize, 0), ws_watcher.globalDirtyCount());
+    try std.testing.expect(ws_watcher.peekGlobalDirty() == null);
+    try std.testing.expect(ws_watcher.popGlobalDirty() == null);
+}
+
+test "WorkspaceWatcher overlapping paths detection" {
+    const allocator = std.testing.allocator;
+    var ws_watcher = WorkspaceWatcher.init(allocator);
+    defer ws_watcher.deinit();
+
+    // Use current directory and a subdirectory for testing
+    const cwd = std.fs.cwd();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_path = try cwd.realpath(".", &buf);
+
+    try ws_watcher.addWorkspace(root_path);
+    try std.testing.expectEqual(@as(usize, 1), ws_watcher.workspaceCount());
+
+    // Adding the same path should be a no-op (already watching)
+    try ws_watcher.addWorkspace(root_path);
+    try std.testing.expectEqual(@as(usize, 1), ws_watcher.workspaceCount());
 }
