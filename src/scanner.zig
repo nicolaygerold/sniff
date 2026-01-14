@@ -6,15 +6,13 @@ pub const ScanConfig = struct {
     max_depth: usize = 20,
     ignore_hidden: bool = true,
     respect_gitignore: bool = true,
+    // Only ignore truly universal non-source directories
+    // Removed "build", "vendor", "dist" - they often contain source in real projects
     ignore_patterns: []const []const u8 = &.{
         "node_modules",
         ".git",
-        "target",
-        "build",
         "__pycache__",
         ".venv",
-        "vendor",
-        "dist",
         ".zig-cache",
         "zig-out",
     },
@@ -75,21 +73,22 @@ pub const Scanner = struct {
                 continue;
             }
 
-            // AGGRESSIVE DIRECTORY PRUNING - key optimization
-            // Check if we should skip this entire directory BEFORE recursing
-            if (is_dir and self.config.respect_gitignore) {
-                if (self.gitignore.shouldSkipDir(name)) {
-                    continue;
-                }
-            }
-
-            // Build relative path (only if we're not skipping)
+            // Build relative path
             const rel_path = if (prefix.len == 0)
                 try self.index.arena.allocator().dupe(u8, name)
             else
                 try std.fmt.allocPrint(self.index.arena.allocator(), "{s}/{s}", .{ prefix, name });
 
-            // Check gitignore for files (dirs already checked above for pruning)
+            // AGGRESSIVE DIRECTORY PRUNING - key optimization
+            // Check if we should skip this entire directory BEFORE recursing
+            // Uses full rel_path to support scoped patterns from nested .gitignore
+            if (is_dir and self.config.respect_gitignore) {
+                if (self.gitignore.shouldSkipDirPath(name, rel_path)) {
+                    continue;
+                }
+            }
+
+            // Check gitignore for files
             if (self.config.respect_gitignore and !is_dir) {
                 if (self.gitignore.isFileIgnored(name, rel_path, false)) {
                     continue;
@@ -101,10 +100,11 @@ pub const Scanner = struct {
                 var sub_dir = dir.openDir(name, .{ .iterate = true }) catch continue;
                 defer sub_dir.close();
 
-                // Load nested .gitignore if present
+                // Load nested .gitignore if present, with proper path scoping
                 if (self.config.respect_gitignore) {
                     try self.gitignore.pushSnapshot(depth + 1);
-                    self.gitignore.loadFile(sub_dir) catch {};
+                    // Pass the relative path prefix so patterns are properly scoped
+                    self.gitignore.loadFileWithPrefix(sub_dir, rel_path) catch {};
                 }
 
                 try self.scanDir(sub_dir, rel_path, depth + 1);

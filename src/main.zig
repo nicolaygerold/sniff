@@ -18,12 +18,15 @@ pub fn main() !void {
     var query_arg: ?[]const u8 = null;
     var mode: Mode = .interactive;
     var max_results: usize = 100;
+    var respect_gitignore: bool = true;
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--json")) {
             mode = .json;
+        } else if (std.mem.eql(u8, arg, "--no-ignore")) {
+            respect_gitignore = false;
         } else if (std.mem.eql(u8, arg, "--limit")) {
             i += 1;
             if (i < args.len) {
@@ -55,7 +58,10 @@ pub fn main() !void {
     };
     defer allocator.free(abs_path);
 
-    var sniff = Sniff.init(allocator, Config{ .max_results = max_results });
+    var sniff = Sniff.init(allocator, Config{
+        .max_results = max_results,
+        .scan = .{ .respect_gitignore = respect_gitignore },
+    });
     defer sniff.deinit();
 
     const start = std.time.milliTimestamp();

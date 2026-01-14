@@ -6,6 +6,7 @@ const ComplexPattern = struct {
     pattern: []const u8,
     is_dir_only: bool,
     is_anchored: bool,
+    scope: []const u8, // Directory scope (empty for root gitignore)
 };
 
 /// Prefix pattern for anchored paths like "build/*" or "/vendor"
@@ -14,14 +15,23 @@ const PrefixPattern = struct {
     is_dir_only: bool,
 };
 
+/// Extension pattern with scope
+const ScopedExtension = struct {
+    ext: []const u8,
+    scope: []const u8, // Directory scope (paths must start with this)
+};
+
 /// Optimized gitignore with fast-path lookups
 pub const FastGitIgnore = struct {
     allocator: Allocator,
 
-    // O(1) hashset lookups - handles 90%+ of patterns
+    // O(1) hashset lookups - handles 90%+ of patterns (ROOT gitignore only)
     literal_dirs: std.StringHashMapUnmanaged(void),
     literal_files: std.StringHashMapUnmanaged(void),
-    extensions: std.StringHashMapUnmanaged(void),
+    extensions: std.StringHashMapUnmanaged(void), // Global extensions from root gitignore
+
+    // Scoped extensions from nested gitignores
+    scoped_extensions: std.ArrayListUnmanaged(ScopedExtension),
 
     // Prefix patterns (anchored like "build/*", "/vendor")
     prefix_patterns: std.ArrayListUnmanaged(PrefixPattern),
@@ -55,6 +65,7 @@ pub const FastGitIgnore = struct {
             .literal_dirs = .{},
             .literal_files = .{},
             .extensions = .{},
+            .scoped_extensions = .{},
             .prefix_patterns = .{},
             .complex_patterns = .{},
             .negation_literals = .{},
@@ -68,6 +79,7 @@ pub const FastGitIgnore = struct {
         self.literal_dirs.deinit(self.allocator);
         self.literal_files.deinit(self.allocator);
         self.extensions.deinit(self.allocator);
+        self.scoped_extensions.deinit(self.allocator);
         self.prefix_patterns.deinit(self.allocator);
         self.complex_patterns.deinit(self.allocator);
         self.negation_literals.deinit(self.allocator);
@@ -88,6 +100,31 @@ pub const FastGitIgnore = struct {
         return false;
     }
 
+    /// Check if a directory at rel_path should be skipped
+    /// This handles both global literal patterns and scoped prefix patterns
+    pub fn shouldSkipDirPath(self: *const FastGitIgnore, dir_name: []const u8, rel_path: []const u8) bool {
+        // Check negations first
+        if (self.negation_literals.contains(dir_name)) return false;
+
+        // Fast O(1) lookup for global literal directory names
+        if (self.literal_dirs.contains(dir_name)) return true;
+
+        // Check prefix patterns (for scoped patterns from nested .gitignore)
+        for (self.prefix_patterns.items) |p| {
+            if (!p.is_dir_only) continue;
+            // Prefix pattern should match exactly (with trailing slash for dirs)
+            if (std.mem.eql(u8, p.prefix, rel_path) or
+                (p.prefix.len == rel_path.len + 1 and
+                std.mem.startsWith(u8, p.prefix, rel_path) and
+                p.prefix[p.prefix.len - 1] == '/'))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /// Check if file should be ignored (fast paths first, complex glob last)
     pub fn isFileIgnored(self: *const FastGitIgnore, basename: []const u8, rel_path: []const u8, is_dir: bool) bool {
         var ignored = false;
@@ -102,7 +139,7 @@ pub const FastGitIgnore = struct {
             ignored = true;
         }
 
-        // 3. Check extensions - O(1)
+        // 3. Check global extensions - O(1) (from root gitignore only)
         if (!ignored and !is_dir) {
             if (getExtension(basename)) |ext| {
                 if (self.extensions.contains(ext)) {
@@ -111,13 +148,39 @@ pub const FastGitIgnore = struct {
             }
         }
 
+        // 3b. Check scoped extensions (from nested gitignores)
+        if (!ignored and !is_dir) {
+            if (getExtension(basename)) |ext| {
+                for (self.scoped_extensions.items) |se| {
+                    if (std.mem.eql(u8, se.ext, ext)) {
+                        // Check if path is within scope
+                        if (std.mem.startsWith(u8, rel_path, se.scope) and
+                            (rel_path.len == se.scope.len or rel_path[se.scope.len] == '/'))
+                        {
+                            ignored = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         // 4. Check prefix patterns - O(prefix_count), usually small
         if (!ignored) {
             for (self.prefix_patterns.items) |p| {
                 if (p.is_dir_only and !is_dir) continue;
-                if (std.mem.startsWith(u8, rel_path, p.prefix)) {
-                    ignored = true;
-                    break;
+                if (p.is_dir_only) {
+                    // For directories, match if path starts with prefix (matches dir and contents)
+                    if (std.mem.startsWith(u8, rel_path, p.prefix)) {
+                        ignored = true;
+                        break;
+                    }
+                } else {
+                    // For files, exact match required
+                    if (std.mem.eql(u8, rel_path, p.prefix)) {
+                        ignored = true;
+                        break;
+                    }
                 }
             }
         }
@@ -126,9 +189,25 @@ pub const FastGitIgnore = struct {
         if (!ignored) {
             for (self.complex_patterns.items) |p| {
                 if (p.is_dir_only and !is_dir) continue;
-                if (globMatch(p.pattern, rel_path, p.is_anchored, basename)) {
-                    ignored = true;
-                    break;
+                // Check if path is within the pattern's scope
+                if (p.scope.len > 0) {
+                    // Path must start with scope + "/"
+                    if (!std.mem.startsWith(u8, rel_path, p.scope)) continue;
+                    if (rel_path.len > p.scope.len and rel_path[p.scope.len] != '/') continue;
+                    // Get the path relative to scope
+                    const scoped_path = if (rel_path.len > p.scope.len + 1)
+                        rel_path[p.scope.len + 1 ..]
+                    else
+                        "";
+                    if (globMatch(p.pattern, scoped_path, p.is_anchored, basename)) {
+                        ignored = true;
+                        break;
+                    }
+                } else {
+                    if (globMatch(p.pattern, rel_path, p.is_anchored, basename)) {
+                        ignored = true;
+                        break;
+                    }
                 }
             }
         }
@@ -152,8 +231,21 @@ pub const FastGitIgnore = struct {
             // Check complex negations
             for (self.negation_complex.items) |p| {
                 if (p.is_dir_only and !is_dir) continue;
-                if (globMatch(p.pattern, rel_path, p.is_anchored, basename)) {
-                    return false;
+                // Check if path is within the pattern's scope
+                if (p.scope.len > 0) {
+                    if (!std.mem.startsWith(u8, rel_path, p.scope)) continue;
+                    if (rel_path.len > p.scope.len and rel_path[p.scope.len] != '/') continue;
+                    const scoped_path = if (rel_path.len > p.scope.len + 1)
+                        rel_path[p.scope.len + 1 ..]
+                    else
+                        "";
+                    if (globMatch(p.pattern, scoped_path, p.is_anchored, basename)) {
+                        return false;
+                    }
+                } else {
+                    if (globMatch(p.pattern, rel_path, p.is_anchored, basename)) {
+                        return false;
+                    }
                 }
             }
         }
@@ -162,19 +254,26 @@ pub const FastGitIgnore = struct {
     }
 
     /// Load and parse .gitignore file from directory
+    /// prefix is the relative path to this directory (empty for root)
     pub fn loadFile(self: *FastGitIgnore, dir: std.fs.Dir) !void {
+        try self.loadFileWithPrefix(dir, "");
+    }
+
+    /// Load .gitignore with a directory prefix for proper scoping
+    pub fn loadFileWithPrefix(self: *FastGitIgnore, dir: std.fs.Dir, prefix: []const u8) !void {
         const file = dir.openFile(".gitignore", .{}) catch |err| {
             if (err == error.FileNotFound) return;
             return err;
         };
         defer file.close();
 
-        var buf: [8192]u8 = undefined;
+        // Use larger buffer to handle big .gitignore files (e.g., Chromium's is ~10KB)
+        var buf: [32768]u8 = undefined;
         const bytes_read = file.read(&buf) catch return;
 
         var lines = std.mem.splitScalar(u8, buf[0..bytes_read], '\n');
         while (lines.next()) |raw_line| {
-            self.parseLine(raw_line) catch continue;
+            self.parseLineWithPrefix(raw_line, prefix) catch continue;
         }
     }
 
@@ -209,8 +308,15 @@ pub const FastGitIgnore = struct {
         }
     }
 
-    /// Parse a single gitignore line and categorize it
+    /// Parse a single gitignore line (for root .gitignore only)
     pub fn parseLine(self: *FastGitIgnore, raw_line: []const u8) !void {
+        try self.parseLineWithPrefix(raw_line, "");
+    }
+
+    /// Parse a single gitignore line with directory prefix for proper scoping
+    /// For nested .gitignore files, patterns without slashes should only apply
+    /// within that directory, not globally.
+    pub fn parseLineWithPrefix(self: *FastGitIgnore, raw_line: []const u8, prefix: []const u8) !void {
         var line = std.mem.trim(u8, raw_line, "\r \t");
 
         if (line.len == 0 or line[0] == '#') return;
@@ -240,47 +346,96 @@ pub const FastGitIgnore = struct {
         const has_slash = std.mem.indexOfScalar(u8, line, '/') != null;
         if (has_slash) is_anchored = true;
 
+        // For nested .gitignore files, literal patterns should be scoped
+        // to their containing directory, not applied globally.
+        // Extension patterns (*.log, etc.) are still global since they're universal.
+        const is_root = prefix.len == 0;
+
         // Categorize the pattern
         const category = categorizePattern(line, is_dir_only);
 
         switch (category) {
             .literal_dir => {
-                const key = try self.allocator.dupe(u8, line);
-                if (is_negation) {
-                    try self.negation_literals.put(self.allocator, key, {});
+                // For nested .gitignore OR anchored patterns, convert to prefix patterns
+                // Global hashsets only for non-anchored patterns from root gitignore
+                if ((!is_root or is_anchored) and !is_negation) {
+                    // Convert to prefix pattern with full path
+                    const scoped = if (prefix.len > 0)
+                        try std.fmt.allocPrint(self.allocator, "{s}/{s}/", .{ prefix, line })
+                    else
+                        try std.fmt.allocPrint(self.allocator, "{s}/", .{line});
+                    try self.prefix_patterns.append(self.allocator, .{
+                        .prefix = scoped,
+                        .is_dir_only = true,
+                    });
                 } else {
-                    try self.literal_dirs.put(self.allocator, key, {});
+                    const key = try self.allocator.dupe(u8, line);
+                    if (is_negation) {
+                        try self.negation_literals.put(self.allocator, key, {});
+                    } else {
+                        try self.literal_dirs.put(self.allocator, key, {});
+                    }
                 }
             },
             .literal_file => {
-                const key = try self.allocator.dupe(u8, line);
-                if (is_negation) {
-                    try self.negation_literals.put(self.allocator, key, {});
+                // For nested .gitignore OR anchored patterns, convert to prefix patterns
+                // Global hashsets only for non-anchored patterns from root gitignore
+                if ((!is_root or is_anchored) and !is_negation) {
+                    const scoped = if (prefix.len > 0)
+                        try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ prefix, line })
+                    else
+                        try self.allocator.dupe(u8, line);
+                    try self.prefix_patterns.append(self.allocator, .{
+                        .prefix = scoped,
+                        .is_dir_only = false,
+                    });
                 } else {
-                    try self.literal_files.put(self.allocator, key, {});
+                    const key = try self.allocator.dupe(u8, line);
+                    if (is_negation) {
+                        try self.negation_literals.put(self.allocator, key, {});
+                    } else {
+                        try self.literal_files.put(self.allocator, key, {});
+                    }
                 }
             },
             .extension => |ext| {
                 const key = try self.allocator.dupe(u8, ext);
                 if (is_negation) {
                     try self.negation_extensions.put(self.allocator, key, {});
-                } else {
+                } else if (is_root) {
+                    // Only root gitignore extensions go to global hashset
                     try self.extensions.put(self.allocator, key, {});
+                } else {
+                    // Nested gitignore extensions are scoped to their directory
+                    const scope = try self.allocator.dupe(u8, prefix);
+                    try self.scoped_extensions.append(self.allocator, .{
+                        .ext = key,
+                        .scope = scope,
+                    });
                 }
             },
-            .prefix => |prefix| {
-                const p = try self.allocator.dupe(u8, prefix);
+            .prefix => |pat| {
+                // Scope prefix pattern to nested directory
+                const scoped = if (!is_root)
+                    try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ prefix, pat })
+                else
+                    try self.allocator.dupe(u8, pat);
                 try self.prefix_patterns.append(self.allocator, .{
-                    .prefix = p,
+                    .prefix = scoped,
                     .is_dir_only = is_dir_only,
                 });
             },
             .complex => {
                 const p = try self.allocator.dupe(u8, line);
+                const scope = if (prefix.len > 0)
+                    try self.allocator.dupe(u8, prefix)
+                else
+                    "";
                 const pattern = ComplexPattern{
                     .pattern = p,
                     .is_dir_only = is_dir_only,
                     .is_anchored = is_anchored,
+                    .scope = scope,
                 };
                 if (is_negation) {
                     try self.negation_complex.append(self.allocator, pattern);
