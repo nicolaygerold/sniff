@@ -996,6 +996,9 @@ pub fn Debouncer(comptime debounce_ms: i64) type {
             var iter = self.pending.iterator();
             while (iter.next()) |entry| {
                 if (now - entry.value_ptr.last_event >= debounce_ms) {
+                    // NOTE: We pass the key directly without duping.
+                    // The caller (KqueueWatcher.poll) clears events each call,
+                    // and we must NOT free the path here - ownership transfers to caller.
                     try events.append(.{
                         .path = entry.key_ptr.*,
                         .kind = entry.value_ptr.kind,
@@ -1005,8 +1008,8 @@ pub fn Debouncer(comptime debounce_ms: i64) type {
             }
 
             for (to_remove.items) |path| {
+                // Remove from pending but DON'T free - ownership transferred to events
                 _ = self.pending.remove(path);
-                self.allocator.free(path);
             }
         }
 
@@ -1148,6 +1151,13 @@ pub const KqueueWatcher = struct {
     }
 
     pub fn poll(self: *KqueueWatcher) ![]WatchEvent {
+        // Free paths from previous poll's events before clearing
+        for (self.events.items) |ev| {
+            // Paths owned by debouncer need to be freed
+            if (ev.path.len > 0) {
+                self.allocator.free(ev.path);
+            }
+        }
         self.events.clearRetainingCapacity();
 
         // Expire pending rename if too old
@@ -1703,7 +1713,10 @@ test "Debouncer event merging" {
     try debouncer.recordEvent("/test/file.txt", .modified);
 
     var events = std.ArrayList(WatchEvent).init(allocator);
-    defer events.deinit();
+    defer {
+        for (events.items) |ev| if (ev.path.len > 0) allocator.free(ev.path);
+        events.deinit();
+    }
 
     try debouncer.collectReady(&events);
 
@@ -1721,7 +1734,10 @@ test "Debouncer skip duplicate Create (notify-rs pattern)" {
     try debouncer.recordEvent("/test/file.txt", .created);
 
     var events = std.ArrayList(WatchEvent).init(allocator);
-    defer events.deinit();
+    defer {
+        for (events.items) |ev| if (ev.path.len > 0) allocator.free(ev.path);
+        events.deinit();
+    }
 
     try debouncer.collectReady(&events);
 
@@ -1740,7 +1756,10 @@ test "Debouncer suppress Modify after Create (notify-rs pattern)" {
     try debouncer.recordEvent("/test/file.txt", .modified);
 
     var events = std.ArrayList(WatchEvent).init(allocator);
-    defer events.deinit();
+    defer {
+        for (events.items) |ev| if (ev.path.len > 0) allocator.free(ev.path);
+        events.deinit();
+    }
 
     try debouncer.collectReady(&events);
 
@@ -1757,7 +1776,10 @@ test "Debouncer created + deleted = deleted" {
     try debouncer.recordEvent("/test/file.txt", .deleted);
 
     var events = std.ArrayList(WatchEvent).init(allocator);
-    defer events.deinit();
+    defer {
+        for (events.items) |ev| if (ev.path.len > 0) allocator.free(ev.path);
+        events.deinit();
+    }
 
     try debouncer.collectReady(&events);
 
@@ -1774,7 +1796,10 @@ test "Debouncer modified + deleted = deleted" {
     try debouncer.recordEvent("/test/file.txt", .deleted);
 
     var events = std.ArrayList(WatchEvent).init(allocator);
-    defer events.deinit();
+    defer {
+        for (events.items) |ev| if (ev.path.len > 0) allocator.free(ev.path);
+        events.deinit();
+    }
 
     try debouncer.collectReady(&events);
 
