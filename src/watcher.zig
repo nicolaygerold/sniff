@@ -15,51 +15,51 @@ pub const WatchEvent = struct {
     };
 };
 
+const is_bsd = switch (builtin.os.tag) {
+    .macos, .freebsd, .openbsd, .netbsd => true,
+    else => false,
+};
+
 pub const Watcher = union(enum) {
-    kqueue: KqueueWatcher,
-    inotify: InotifyWatcher,
-    windows: WindowsWatcher,
+    kqueue: if (is_bsd) KqueueWatcher else void,
+    inotify: if (builtin.os.tag == .linux) InotifyWatcher else void,
+    windows: if (builtin.os.tag == .windows) WindowsWatcher else void,
     polling: PollWatcher,
 
     pub fn init(allocator: Allocator, root: []const u8) !Watcher {
-        switch (builtin.os.tag) {
-            .macos, .freebsd, .openbsd, .netbsd => {
-                return .{ .kqueue = try KqueueWatcher.init(allocator, root) };
-            },
-            .linux => {
-                return .{ .inotify = try InotifyWatcher.init(allocator, root) };
-            },
-            .windows => {
-                return .{ .windows = try WindowsWatcher.init(allocator, root) };
-            },
-            else => {
-                return .{ .polling = try PollWatcher.init(allocator, root) };
-            },
+        if (is_bsd) {
+            return .{ .kqueue = try KqueueWatcher.init(allocator, root) };
+        } else if (builtin.os.tag == .linux) {
+            return .{ .inotify = try InotifyWatcher.init(allocator, root) };
+        } else if (builtin.os.tag == .windows) {
+            return .{ .windows = try WindowsWatcher.init(allocator, root) };
+        } else {
+            return .{ .polling = try PollWatcher.init(allocator, root) };
         }
     }
 
     pub fn deinit(self: *Watcher) void {
         switch (self.*) {
-            .kqueue => |*w| w.deinit(),
-            .inotify => |*w| w.deinit(),
-            .windows => |*w| w.deinit(),
+            .kqueue => |*w| if (is_bsd) w.deinit(),
+            .inotify => |*w| if (builtin.os.tag == .linux) w.deinit(),
+            .windows => |*w| if (builtin.os.tag == .windows) w.deinit(),
             .polling => |*w| w.deinit(),
         }
     }
 
     pub fn poll(self: *Watcher) ![]WatchEvent {
         return switch (self.*) {
-            .kqueue => |*w| w.poll(),
-            .inotify => |*w| w.poll(),
-            .windows => |*w| w.poll(),
+            .kqueue => |*w| if (is_bsd) w.poll() else unreachable,
+            .inotify => |*w| if (builtin.os.tag == .linux) w.poll() else unreachable,
+            .windows => |*w| if (builtin.os.tag == .windows) w.poll() else unreachable,
             .polling => |*w| w.poll(),
         };
     }
 
     pub fn getFd(self: *Watcher) ?std.posix.fd_t {
         switch (self.*) {
-            .kqueue => |w| return w.kq,
-            .inotify => |w| return w.fd,
+            .kqueue => |w| return if (is_bsd) w.kq else null,
+            .inotify => |w| return if (builtin.os.tag == .linux) w.fd else null,
             .windows, .polling => return null,
         }
     }
