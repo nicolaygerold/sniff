@@ -224,6 +224,409 @@ pub const FileIdCache = struct {
 };
 
 // =============================================================================
+// WatchEntry - Entry abstraction with importance scoring
+// Tracks files/directories with priority for dirty file processing
+// Importance factors: file type (source > generated), recency, open status
+// =============================================================================
+
+pub const WatchEntry = struct {
+    path: []const u8,
+    kind: Kind,
+    importance: u32,
+    last_modified: i64,
+    is_open: bool,
+
+    pub const Kind = enum {
+        file,
+        directory,
+    };
+
+    pub const Importance = struct {
+        pub const BASE: u32 = 100;
+        pub const OPEN_FILE: u32 = 500;
+        pub const SOURCE_FILE: u32 = 200;
+        pub const CONFIG_FILE: u32 = 150;
+        pub const TEST_FILE: u32 = 100;
+        pub const GENERATED_FILE: u32 = 10;
+        pub const RECENCY_BONUS_MAX: u32 = 100;
+        pub const RECENCY_DECAY_MS: i64 = 60_000;
+    };
+
+    pub fn calculateImportance(path: []const u8, is_open: bool, last_modified: i64) u32 {
+        var score: u32 = Importance.BASE;
+
+        if (is_open) {
+            score += Importance.OPEN_FILE;
+        }
+
+        score += getFileTypeBonus(path);
+        score += getRecencyBonus(last_modified);
+
+        return score;
+    }
+
+    fn getFileTypeBonus(path: []const u8) u32 {
+        const ext = getExtension(path);
+
+        if (std.mem.eql(u8, ext, ".zig") or
+            std.mem.eql(u8, ext, ".rs") or
+            std.mem.eql(u8, ext, ".go") or
+            std.mem.eql(u8, ext, ".ts") or
+            std.mem.eql(u8, ext, ".tsx") or
+            std.mem.eql(u8, ext, ".js") or
+            std.mem.eql(u8, ext, ".jsx") or
+            std.mem.eql(u8, ext, ".py") or
+            std.mem.eql(u8, ext, ".c") or
+            std.mem.eql(u8, ext, ".h") or
+            std.mem.eql(u8, ext, ".cpp") or
+            std.mem.eql(u8, ext, ".hpp"))
+        {
+            return Importance.SOURCE_FILE;
+        }
+
+        if (std.mem.eql(u8, ext, ".json") or
+            std.mem.eql(u8, ext, ".toml") or
+            std.mem.eql(u8, ext, ".yaml") or
+            std.mem.eql(u8, ext, ".yml") or
+            std.mem.eql(u8, ext, ".md"))
+        {
+            return Importance.CONFIG_FILE;
+        }
+
+        if (containsTestIndicator(path)) {
+            return Importance.TEST_FILE;
+        }
+
+        if (isGeneratedFile(path)) {
+            return Importance.GENERATED_FILE;
+        }
+
+        return 0;
+    }
+
+    fn getExtension(path: []const u8) []const u8 {
+        var i = path.len;
+        while (i > 0) : (i -= 1) {
+            if (path[i - 1] == '.') {
+                return path[i - 1 ..];
+            }
+            if (path[i - 1] == '/' or path[i - 1] == '\\') {
+                break;
+            }
+        }
+        return "";
+    }
+
+    fn containsTestIndicator(path: []const u8) bool {
+        const lower = path;
+        return std.mem.indexOf(u8, lower, "_test.") != null or
+            std.mem.indexOf(u8, lower, ".test.") != null or
+            std.mem.indexOf(u8, lower, "/test/") != null or
+            std.mem.indexOf(u8, lower, "/tests/") != null or
+            std.mem.indexOf(u8, lower, "_spec.") != null;
+    }
+
+    fn isGeneratedFile(path: []const u8) bool {
+        return std.mem.indexOf(u8, path, "/gen/") != null or
+            std.mem.indexOf(u8, path, "/generated/") != null or
+            std.mem.indexOf(u8, path, ".gen.") != null or
+            std.mem.indexOf(u8, path, ".generated.") != null or
+            std.mem.indexOf(u8, path, "/node_modules/") != null or
+            std.mem.indexOf(u8, path, "/zig-cache/") != null or
+            std.mem.indexOf(u8, path, "/zig-out/") != null or
+            std.mem.indexOf(u8, path, "/target/") != null or
+            std.mem.indexOf(u8, path, "/.git/") != null;
+    }
+
+    fn getRecencyBonus(last_modified: i64) u32 {
+        const now = std.time.milliTimestamp();
+        const age_ms = now - last_modified;
+
+        if (age_ms <= 0) {
+            return Importance.RECENCY_BONUS_MAX;
+        }
+
+        if (age_ms >= Importance.RECENCY_DECAY_MS) {
+            return 0;
+        }
+
+        const ratio = @as(u32, @intCast(@divFloor(age_ms * Importance.RECENCY_BONUS_MAX, Importance.RECENCY_DECAY_MS)));
+        return Importance.RECENCY_BONUS_MAX -| ratio;
+    }
+};
+
+// =============================================================================
+// DirtyFileHeap - Binary heap for prioritized dirty file processing
+// Higher importance files are processed first
+// =============================================================================
+
+pub const DirtyFileHeap = struct {
+    const Self = @This();
+    const MAX_ENTRIES = 1024;
+
+    entries: std.BoundedArray(HeapEntry, MAX_ENTRIES),
+
+    const HeapEntry = struct {
+        path: []const u8,
+        importance: u32,
+        timestamp: i64,
+    };
+
+    pub fn init() Self {
+        return .{
+            .entries = .{},
+        };
+    }
+
+    pub fn insert(self: *Self, path: []const u8, importance: u32) void {
+        const entry = HeapEntry{
+            .path = path,
+            .importance = importance,
+            .timestamp = std.time.milliTimestamp(),
+        };
+
+        for (self.entries.slice(), 0..) |existing, i| {
+            if (std.mem.eql(u8, existing.path, path)) {
+                self.entries.buffer[i] = entry;
+                self.siftUp(i);
+                self.siftDown(i);
+                return;
+            }
+        }
+
+        if (self.entries.len < MAX_ENTRIES) {
+            self.entries.append(entry) catch return;
+            self.siftUp(self.entries.len - 1);
+        } else if (importance > self.entries.buffer[self.entries.len - 1].importance) {
+            self.entries.buffer[self.entries.len - 1] = entry;
+            self.siftUp(self.entries.len - 1);
+        }
+    }
+
+    pub fn pop(self: *Self) ?HeapEntry {
+        if (self.entries.len == 0) return null;
+
+        const top = self.entries.buffer[0];
+        self.entries.buffer[0] = self.entries.buffer[self.entries.len - 1];
+        _ = self.entries.pop();
+
+        if (self.entries.len > 0) {
+            self.siftDown(0);
+        }
+
+        return top;
+    }
+
+    pub fn peek(self: *const Self) ?HeapEntry {
+        if (self.entries.len == 0) return null;
+        return self.entries.buffer[0];
+    }
+
+    pub fn len(self: *const Self) usize {
+        return self.entries.len;
+    }
+
+    pub fn remove(self: *Self, path: []const u8) bool {
+        for (self.entries.slice(), 0..) |entry, i| {
+            if (std.mem.eql(u8, entry.path, path)) {
+                self.entries.buffer[i] = self.entries.buffer[self.entries.len - 1];
+                _ = self.entries.pop();
+                if (i < self.entries.len) {
+                    self.siftUp(i);
+                    self.siftDown(i);
+                }
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn siftUp(self: *Self, idx: usize) void {
+        var i = idx;
+        while (i > 0) {
+            const parent = (i - 1) / 2;
+            if (self.entries.buffer[i].importance > self.entries.buffer[parent].importance) {
+                const tmp = self.entries.buffer[i];
+                self.entries.buffer[i] = self.entries.buffer[parent];
+                self.entries.buffer[parent] = tmp;
+                i = parent;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn siftDown(self: *Self, idx: usize) void {
+        var i = idx;
+        while (true) {
+            var largest = i;
+            const left = 2 * i + 1;
+            const right = 2 * i + 2;
+
+            if (left < self.entries.len and
+                self.entries.buffer[left].importance > self.entries.buffer[largest].importance)
+            {
+                largest = left;
+            }
+
+            if (right < self.entries.len and
+                self.entries.buffer[right].importance > self.entries.buffer[largest].importance)
+            {
+                largest = right;
+            }
+
+            if (largest != i) {
+                const tmp = self.entries.buffer[i];
+                self.entries.buffer[i] = self.entries.buffer[largest];
+                self.entries.buffer[largest] = tmp;
+                i = largest;
+            } else {
+                break;
+            }
+        }
+    }
+};
+
+// =============================================================================
+// WatchState - Manages watched entries and their importance
+// Supports recursive directory watching with inherited importance
+// =============================================================================
+
+pub const WatchState = struct {
+    const Self = @This();
+
+    entries: std.StringHashMap(WatchEntry),
+    open_files: std.StringHashMap(void),
+    dirty_files: DirtyFileHeap,
+    allocator: Allocator,
+
+    pub fn init(allocator: Allocator) Self {
+        return .{
+            .entries = std.StringHashMap(WatchEntry).init(allocator),
+            .open_files = std.StringHashMap(void).init(allocator),
+            .dirty_files = DirtyFileHeap.init(),
+            .allocator = allocator,
+        };
+    }
+
+    pub fn deinit(self: *Self) void {
+        var key_iter = self.entries.keyIterator();
+        while (key_iter.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.entries.deinit();
+
+        var open_iter = self.open_files.keyIterator();
+        while (open_iter.next()) |key| {
+            self.allocator.free(key.*);
+        }
+        self.open_files.deinit();
+    }
+
+    pub fn addEntry(self: *Self, path: []const u8, kind: WatchEntry.Kind) !void {
+        if (self.entries.contains(path)) {
+            return;
+        }
+
+        const now = std.time.milliTimestamp();
+        const is_open = self.open_files.contains(path);
+        const importance = WatchEntry.calculateImportance(path, is_open, now);
+
+        const path_owned = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(path_owned);
+
+        try self.entries.put(path_owned, WatchEntry{
+            .path = path_owned,
+            .kind = kind,
+            .importance = importance,
+            .last_modified = now,
+            .is_open = is_open,
+        });
+    }
+
+    pub fn removeEntry(self: *Self, path: []const u8) void {
+        if (self.entries.fetchRemove(path)) |kv| {
+            _ = self.dirty_files.remove(path);
+            self.allocator.free(kv.key);
+        }
+    }
+
+    pub fn markDirty(self: *Self, path: []const u8) void {
+        if (self.entries.getPtr(path)) |entry| {
+            const now = std.time.milliTimestamp();
+            entry.last_modified = now;
+            entry.importance = WatchEntry.calculateImportance(path, entry.is_open, now);
+            self.dirty_files.insert(entry.path, entry.importance);
+        }
+    }
+
+    pub fn markOpen(self: *Self, path: []const u8) !void {
+        if (!self.open_files.contains(path)) {
+            const path_owned = try self.allocator.dupe(u8, path);
+            try self.open_files.put(path_owned, {});
+        }
+
+        if (self.entries.getPtr(path)) |entry| {
+            entry.is_open = true;
+            entry.importance = WatchEntry.calculateImportance(path, true, entry.last_modified);
+        }
+    }
+
+    pub fn markClosed(self: *Self, path: []const u8) void {
+        if (self.open_files.fetchRemove(path)) |kv| {
+            self.allocator.free(kv.key);
+        }
+
+        if (self.entries.getPtr(path)) |entry| {
+            entry.is_open = false;
+            entry.importance = WatchEntry.calculateImportance(path, false, entry.last_modified);
+        }
+    }
+
+    pub fn popDirty(self: *Self) ?[]const u8 {
+        if (self.dirty_files.pop()) |entry| {
+            return entry.path;
+        }
+        return null;
+    }
+
+    pub fn peekDirty(self: *const Self) ?[]const u8 {
+        if (self.dirty_files.peek()) |entry| {
+            return entry.path;
+        }
+        return null;
+    }
+
+    pub fn dirtyCount(self: *const Self) usize {
+        return self.dirty_files.len();
+    }
+
+    pub fn addDirectoryRecursive(self: *Self, dir_path: []const u8, parent_importance: u32, depth: usize) !void {
+        const MAX_DEPTH = 20;
+        if (depth > MAX_DEPTH) return;
+
+        try self.addEntry(dir_path, .directory);
+
+        var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
+        defer dir.close();
+
+        var iter = dir.iterate();
+        while (iter.next() catch return) |entry| {
+            if (entry.name.len > 0 and entry.name[0] == '.') continue;
+
+            const child_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, entry.name }) catch continue;
+            defer self.allocator.free(child_path);
+
+            if (entry.kind == .directory) {
+                self.addDirectoryRecursive(child_path, parent_importance, depth + 1) catch {};
+            } else if (entry.kind == .file) {
+                self.addEntry(child_path, .file) catch {};
+            }
+        }
+    }
+};
+
+// =============================================================================
 // Debounce state for per-path event coalescing (notify-rs patterns)
 // Key patterns from notify-debouncer-full:
 // - Skip duplicate Create events
@@ -1017,4 +1420,135 @@ test "watcher init" {
     defer watcher.deinit();
 
     _ = try watcher.poll();
+}
+
+test "WatchEntry file type detection" {
+    const now = std.time.milliTimestamp();
+
+    const zig_importance = WatchEntry.calculateImportance("/src/main.zig", false, now);
+    const json_importance = WatchEntry.calculateImportance("/config.json", false, now);
+    const gen_importance = WatchEntry.calculateImportance("/zig-cache/file.o", false, now);
+    const txt_importance = WatchEntry.calculateImportance("/readme.txt", false, now);
+
+    try std.testing.expect(zig_importance > json_importance);
+    try std.testing.expect(json_importance > gen_importance);
+    try std.testing.expect(zig_importance > txt_importance);
+    try std.testing.expect(txt_importance >= WatchEntry.Importance.BASE);
+}
+
+test "WatchEntry open file bonus" {
+    const now = std.time.milliTimestamp();
+
+    const closed = WatchEntry.calculateImportance("/src/main.zig", false, now);
+    const open = WatchEntry.calculateImportance("/src/main.zig", true, now);
+
+    try std.testing.expect(open > closed);
+    try std.testing.expect(open - closed >= WatchEntry.Importance.OPEN_FILE);
+}
+
+test "WatchEntry test file detection" {
+    const now = std.time.milliTimestamp();
+
+    const test1 = WatchEntry.calculateImportance("/src/main_test.zig", false, now);
+    const test2 = WatchEntry.calculateImportance("/tests/foo.zig", false, now);
+
+    try std.testing.expect(test1 >= WatchEntry.Importance.BASE + WatchEntry.Importance.TEST_FILE);
+    try std.testing.expect(test2 >= WatchEntry.Importance.BASE + WatchEntry.Importance.TEST_FILE);
+}
+
+test "DirtyFileHeap basic operations" {
+    var heap = DirtyFileHeap.init();
+
+    try std.testing.expectEqual(@as(usize, 0), heap.len());
+
+    heap.insert("/low.txt", 100);
+    heap.insert("/high.txt", 500);
+    heap.insert("/mid.txt", 300);
+
+    try std.testing.expectEqual(@as(usize, 3), heap.len());
+
+    const first = heap.pop().?;
+    try std.testing.expectEqualStrings("/high.txt", first.path);
+
+    const second = heap.pop().?;
+    try std.testing.expectEqualStrings("/mid.txt", second.path);
+
+    const third = heap.pop().?;
+    try std.testing.expectEqualStrings("/low.txt", third.path);
+
+    try std.testing.expect(heap.pop() == null);
+}
+
+test "DirtyFileHeap update existing" {
+    var heap = DirtyFileHeap.init();
+
+    heap.insert("/file.txt", 100);
+    heap.insert("/file.txt", 500);
+
+    try std.testing.expectEqual(@as(usize, 1), heap.len());
+    try std.testing.expectEqual(@as(u32, 500), heap.peek().?.importance);
+}
+
+test "DirtyFileHeap remove" {
+    var heap = DirtyFileHeap.init();
+
+    heap.insert("/a.txt", 100);
+    heap.insert("/b.txt", 200);
+    heap.insert("/c.txt", 300);
+
+    try std.testing.expect(heap.remove("/b.txt"));
+    try std.testing.expectEqual(@as(usize, 2), heap.len());
+    try std.testing.expect(!heap.remove("/b.txt"));
+}
+
+test "WatchState basic operations" {
+    const allocator = std.testing.allocator;
+    var state = WatchState.init(allocator);
+    defer state.deinit();
+
+    try state.addEntry("/src/main.zig", .file);
+    try state.addEntry("/src/lib.zig", .file);
+
+    try std.testing.expect(state.entries.contains("/src/main.zig"));
+    try std.testing.expect(state.entries.contains("/src/lib.zig"));
+
+    state.removeEntry("/src/main.zig");
+    try std.testing.expect(!state.entries.contains("/src/main.zig"));
+}
+
+test "WatchState dirty tracking" {
+    const allocator = std.testing.allocator;
+    var state = WatchState.init(allocator);
+    defer state.deinit();
+
+    try state.addEntry("/src/high.zig", .file);
+    try state.addEntry("/zig-cache/low.o", .file);
+
+    state.markDirty("/src/high.zig");
+    state.markDirty("/zig-cache/low.o");
+
+    try std.testing.expectEqual(@as(usize, 2), state.dirtyCount());
+
+    const first = state.popDirty().?;
+    try std.testing.expectEqualStrings("/src/high.zig", first);
+}
+
+test "WatchState open file tracking" {
+    const allocator = std.testing.allocator;
+    var state = WatchState.init(allocator);
+    defer state.deinit();
+
+    try state.addEntry("/src/main.zig", .file);
+
+    const before = state.entries.get("/src/main.zig").?.importance;
+
+    try state.markOpen("/src/main.zig");
+
+    const after = state.entries.get("/src/main.zig").?.importance;
+    try std.testing.expect(after > before);
+
+    state.markClosed("/src/main.zig");
+
+    const final = state.entries.get("/src/main.zig").?.importance;
+    try std.testing.expect(final < after);
 }
