@@ -1057,8 +1057,19 @@ pub const KqueueWatcher = struct {
             .pending_rename = null,
         };
 
-        try self.watchDirRecursive(root, 0);
+        try self.watchDirRecursive(root, "");
         return self;
+    }
+
+    fn toRelativePath(self: *const KqueueWatcher, abs_path: []const u8) []const u8 {
+        if (std.mem.startsWith(u8, abs_path, self.root)) {
+            const rel = abs_path[self.root.len..];
+            if (rel.len > 0 and rel[0] == '/') {
+                return rel[1..];
+            }
+            return rel;
+        }
+        return abs_path;
     }
 
     pub fn deinit(self: *KqueueWatcher) void {
@@ -1086,15 +1097,19 @@ pub const KqueueWatcher = struct {
 
     const MAX_WATCH_DEPTH = 20;
 
-    fn watchDirRecursive(self: *KqueueWatcher, path: []const u8, depth: usize) !void {
+    fn watchDirRecursive(self: *KqueueWatcher, abs_path: []const u8, rel_path: []const u8) !void {
+        return self.watchDirRecursiveDepth(abs_path, rel_path, 0);
+    }
+
+    fn watchDirRecursiveDepth(self: *KqueueWatcher, abs_path: []const u8, rel_path: []const u8, depth: usize) !void {
         if (depth > MAX_WATCH_DEPTH) return;
-        if (self.watched_fds.contains(path)) return;
+        if (self.watched_fds.contains(rel_path)) return;
 
-        const path_owned = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(path_owned);
+        const rel_path_owned = try self.allocator.dupe(u8, rel_path);
+        errdefer self.allocator.free(rel_path_owned);
 
-        const fd = std.posix.open(path_owned, .{ .ACCMODE = .RDONLY }, 0) catch |e| {
-            self.allocator.free(path_owned);
+        const fd = std.posix.open(abs_path, .{ .ACCMODE = .RDONLY }, 0) catch |e| {
+            self.allocator.free(rel_path_owned);
             return e;
         };
         errdefer std.posix.close(fd);
@@ -1111,18 +1126,23 @@ pub const KqueueWatcher = struct {
 
         _ = try std.posix.kevent(self.kq, &changelist, &.{}, null);
 
-        try self.watched_fds.put(path_owned, fd);
-        try self.fd_to_path.put(fd, path_owned);
+        try self.watched_fds.put(rel_path_owned, fd);
+        try self.fd_to_path.put(fd, rel_path_owned);
 
-        var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch return;
+        var dir = std.fs.openDirAbsolute(abs_path, .{ .iterate = true }) catch return;
         defer dir.close();
 
         var iter = dir.iterate();
         while (iter.next() catch return) |entry| {
             if (entry.kind == .directory and entry.name.len > 0 and entry.name[0] != '.') {
-                const subpath = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ path, entry.name });
-                defer self.allocator.free(subpath);
-                self.watchDirRecursive(subpath, depth + 1) catch {};
+                const sub_abs = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ abs_path, entry.name });
+                defer self.allocator.free(sub_abs);
+                const sub_rel = if (rel_path.len == 0)
+                    try self.allocator.dupe(u8, entry.name)
+                else
+                    try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ rel_path, entry.name });
+                defer self.allocator.free(sub_rel);
+                self.watchDirRecursiveDepth(sub_abs, sub_rel, depth + 1) catch {};
             }
         }
     }
@@ -1177,74 +1197,104 @@ pub const KqueueWatcher = struct {
         return self.events.items;
     }
 
-    fn handleRename(self: *KqueueWatcher, old_path: []const u8) !void {
+    fn toAbsolutePath(self: *const KqueueWatcher, allocator: Allocator, rel_path: []const u8) ![]const u8 {
+        if (rel_path.len == 0) {
+            return try allocator.dupe(u8, self.root);
+        }
+        return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.root, rel_path });
+    }
+
+    fn handleRename(self: *KqueueWatcher, old_rel_path: []const u8) !void {
+        const old_abs_path = try self.toAbsolutePath(self.allocator, old_rel_path);
+        defer self.allocator.free(old_abs_path);
+
         // Get the FileID before the rename (if cached)
-        const old_file_id = self.file_id_cache.cachedFileId(old_path);
+        const old_file_id = self.file_id_cache.cachedFileId(old_abs_path);
 
         // Try to find the new path by scanning the parent directory
         // and looking for a file with the same inode
         if (old_file_id) |file_id| {
-            if (self.findNewPathByFileId(old_path, file_id)) |new_path| {
+            if (self.findNewPathByFileId(old_rel_path, old_abs_path, file_id)) |new_rel_path| {
                 // Found the new path - emit rename event for old path, created for new
-                try self.debouncer.recordEvent(old_path, .renamed);
-                try self.debouncer.recordEvent(new_path, .created);
+                try self.debouncer.recordEvent(old_rel_path, .renamed);
+                try self.debouncer.recordEvent(new_rel_path, .created);
 
                 // Update cache
-                self.file_id_cache.removePath(old_path);
-                try self.file_id_cache.addPath(new_path);
-                self.allocator.free(new_path);
+                self.file_id_cache.removePath(old_abs_path);
+                const new_abs_path = self.toAbsolutePath(self.allocator, new_rel_path) catch {
+                    self.allocator.free(new_rel_path);
+                    return;
+                };
+                defer self.allocator.free(new_abs_path);
+                try self.file_id_cache.addPath(new_abs_path);
+                self.allocator.free(new_rel_path);
                 return;
             }
         }
 
         // Could not find new path - treat as simple rename
-        try self.debouncer.recordEvent(old_path, .renamed);
-        self.file_id_cache.removePath(old_path);
+        try self.debouncer.recordEvent(old_rel_path, .renamed);
+        self.file_id_cache.removePath(old_abs_path);
     }
 
-    fn findNewPathByFileId(self: *KqueueWatcher, old_path: []const u8, target_file_id: FileId) ?[]const u8 {
-        // Get the parent directory
-        const last_sep = std.mem.lastIndexOfScalar(u8, old_path, '/') orelse return null;
-        const parent_dir = if (last_sep == 0) "/" else old_path[0..last_sep];
+    fn findNewPathByFileId(self: *KqueueWatcher, old_rel_path: []const u8, old_abs_path: []const u8, target_file_id: FileId) ?[]const u8 {
+        // Get the parent directory (in absolute terms)
+        const last_sep = std.mem.lastIndexOfScalar(u8, old_abs_path, '/') orelse return null;
+        const parent_abs_dir = if (last_sep == 0) "/" else old_abs_path[0..last_sep];
 
-        var dir = std.fs.openDirAbsolute(parent_dir, .{ .iterate = true }) catch return null;
+        // Get the parent directory (in relative terms)
+        const rel_last_sep = std.mem.lastIndexOfScalar(u8, old_rel_path, '/');
+        const parent_rel_dir = if (rel_last_sep) |sep| old_rel_path[0..sep] else "";
+
+        var dir = std.fs.openDirAbsolute(parent_abs_dir, .{ .iterate = true }) catch return null;
         defer dir.close();
 
         var iter = dir.iterate();
         while (iter.next() catch return null) |entry| {
             if (entry.name.len > 0 and entry.name[0] == '.') continue;
 
-            const full_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ parent_dir, entry.name }) catch continue;
+            const full_abs_path = std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ parent_abs_dir, entry.name }) catch continue;
+            defer self.allocator.free(full_abs_path);
 
             // Check if this file has the target FileID
-            if (FileIdCache.getFileId(full_path)) |file_id| {
+            if (FileIdCache.getFileId(full_abs_path)) |file_id| {
                 if (file_id.eql(target_file_id)) {
                     // Skip if this is the old path
-                    if (std.mem.eql(u8, full_path, old_path)) {
-                        self.allocator.free(full_path);
+                    if (std.mem.eql(u8, full_abs_path, old_abs_path)) {
                         continue;
                     }
-                    return full_path;
+                    // Return relative path
+                    if (parent_rel_dir.len == 0) {
+                        return self.allocator.dupe(u8, entry.name) catch null;
+                    }
+                    return std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ parent_rel_dir, entry.name }) catch null;
                 }
             }
-            self.allocator.free(full_path);
         }
 
         return null;
     }
 
-    fn watchNewSubdirs(self: *KqueueWatcher, dir_path: []const u8) !void {
-        var dir = std.fs.openDirAbsolute(dir_path, .{ .iterate = true }) catch return;
+    fn watchNewSubdirs(self: *KqueueWatcher, rel_path: []const u8) !void {
+        const abs_path = try self.toAbsolutePath(self.allocator, rel_path);
+        defer self.allocator.free(abs_path);
+
+        var dir = std.fs.openDirAbsolute(abs_path, .{ .iterate = true }) catch return;
         defer dir.close();
 
         var iter = dir.iterate();
         while (iter.next() catch return) |entry| {
             if (entry.kind == .directory and entry.name.len > 0 and entry.name[0] != '.') {
-                const subpath = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, entry.name });
-                defer self.allocator.free(subpath);
+                const sub_abs = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ abs_path, entry.name });
+                defer self.allocator.free(sub_abs);
+                const sub_rel = if (rel_path.len == 0)
+                    try self.allocator.dupe(u8, entry.name)
+                else
+                    try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ rel_path, entry.name });
+                defer self.allocator.free(sub_rel);
 
-                if (!self.watched_fds.contains(subpath)) {
-                    self.watchDirRecursive(subpath, 0) catch {};
+                if (!self.watched_fds.contains(sub_rel)) {
+                    self.watchDirRecursive(sub_abs, sub_rel) catch {};
                 }
             }
         }
@@ -1281,7 +1331,7 @@ pub const InotifyWatcher = if (builtin.os.tag == .linux) struct {
             .debouncer = Debouncer(50).init(allocator),
         };
 
-        try self.watchDirRecursive(root, 0);
+        try self.watchDirRecursive(root, "");
         return self;
     }
 
@@ -1302,40 +1352,56 @@ pub const InotifyWatcher = if (builtin.os.tag == .linux) struct {
     const MAX_WATCH_DEPTH = 20;
     const RENAME_COOKIE_EXPIRE_MS = 500;
 
-    fn watchDirRecursive(self: *InotifyWatcher, path: []const u8, depth: usize) !void {
+    fn watchDirRecursive(self: *InotifyWatcher, abs_path: []const u8, rel_path: []const u8) !void {
+        return self.watchDirRecursiveDepth(abs_path, rel_path, 0);
+    }
+
+    fn watchDirRecursiveDepth(self: *InotifyWatcher, abs_path: []const u8, rel_path: []const u8, depth: usize) !void {
         if (depth > MAX_WATCH_DEPTH) return;
-        if (self.path_to_wd.contains(path)) return;
+        if (self.path_to_wd.contains(rel_path)) return;
 
-        const path_owned = try self.allocator.dupe(u8, path);
-        errdefer self.allocator.free(path_owned);
+        const rel_path_owned = try self.allocator.dupe(u8, rel_path);
+        errdefer self.allocator.free(rel_path_owned);
 
-        const path_z = try self.allocator.dupeZ(u8, path);
-        defer self.allocator.free(path_z);
+        const abs_path_z = try self.allocator.dupeZ(u8, abs_path);
+        defer self.allocator.free(abs_path_z);
 
         const IN = std.os.linux.IN;
         const wd = std.posix.inotify_add_watch(
             self.fd,
-            path_z,
+            abs_path_z,
             IN.CREATE | IN.DELETE | IN.MODIFY | IN.MOVED_FROM | IN.MOVED_TO | IN.MASK_ADD,
         ) catch |e| {
-            self.allocator.free(path_owned);
+            self.allocator.free(rel_path_owned);
             return e;
         };
 
-        try self.wd_to_path.put(wd, path_owned);
-        try self.path_to_wd.put(path_owned, wd);
+        try self.wd_to_path.put(wd, rel_path_owned);
+        try self.path_to_wd.put(rel_path_owned, wd);
 
-        var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch return;
+        var dir = std.fs.openDirAbsolute(abs_path, .{ .iterate = true }) catch return;
         defer dir.close();
 
         var iter = dir.iterate();
         while (iter.next() catch return) |entry| {
             if (entry.kind == .directory and entry.name.len > 0 and entry.name[0] != '.') {
-                const subpath = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ path, entry.name });
-                defer self.allocator.free(subpath);
-                self.watchDirRecursive(subpath, depth + 1) catch {};
+                const sub_abs = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ abs_path, entry.name });
+                defer self.allocator.free(sub_abs);
+                const sub_rel = if (rel_path.len == 0)
+                    try self.allocator.dupe(u8, entry.name)
+                else
+                    try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ rel_path, entry.name });
+                defer self.allocator.free(sub_rel);
+                self.watchDirRecursiveDepth(sub_abs, sub_rel, depth + 1) catch {};
             }
         }
+    }
+
+    fn toAbsolutePath(self: *const InotifyWatcher, allocator: Allocator, rel_path: []const u8) ![]const u8 {
+        if (rel_path.len == 0) {
+            return try allocator.dupe(u8, self.root);
+        }
+        return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.root, rel_path });
     }
 
     pub fn poll(self: *InotifyWatcher) ![]WatchEvent {
@@ -1354,53 +1420,66 @@ pub const InotifyWatcher = if (builtin.os.tag == .linux) struct {
         var offset: usize = 0;
         while (offset < len) {
             const event: *const std.os.linux.inotify_event = @ptrCast(@alignCast(&self.buf[offset]));
-            const dir_path = self.wd_to_path.get(event.wd) orelse {
+            const dir_rel_path = self.wd_to_path.get(event.wd) orelse {
                 offset += @sizeOf(std.os.linux.inotify_event) + event.len;
                 continue;
             };
 
             if (event.getName()) |name| {
                 if (name.len > 0 and name[0] != '.') {
-                    const full_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, name });
-                    errdefer self.allocator.free(full_path);
+                    const rel_path = if (dir_rel_path.len == 0)
+                        try self.allocator.dupe(u8, name)
+                    else
+                        try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_rel_path, name });
+                    errdefer self.allocator.free(rel_path);
 
                     const IN = std.os.linux.IN;
 
                     if (event.mask & IN.MOVED_FROM != 0) {
-                        self.rename_cookies.put(event.cookie, full_path);
+                        self.rename_cookies.put(event.cookie, rel_path);
                     } else if (event.mask & IN.MOVED_TO != 0) {
                         if (self.rename_cookies.pop(event.cookie)) |old_path| {
                             try self.debouncer.recordEvent(old_path, .renamed);
                             self.allocator.free(old_path);
-                            try self.debouncer.recordEvent(full_path, .created);
-                            self.allocator.free(full_path);
+                            try self.debouncer.recordEvent(rel_path, .created);
+                            self.allocator.free(rel_path);
                         } else {
-                            try self.debouncer.recordEvent(full_path, .created);
-                            self.allocator.free(full_path);
+                            try self.debouncer.recordEvent(rel_path, .created);
+                            self.allocator.free(rel_path);
                         }
 
                         if (event.mask & IN.ISDIR != 0) {
-                            const watch_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, name });
-                            defer self.allocator.free(watch_path);
-                            self.watchDirRecursive(watch_path, 0) catch {};
+                            const sub_rel = if (dir_rel_path.len == 0)
+                                self.allocator.dupe(u8, name) catch continue
+                            else
+                                std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_rel_path, name }) catch continue;
+                            defer self.allocator.free(sub_rel);
+                            const sub_abs = self.toAbsolutePath(self.allocator, sub_rel) catch continue;
+                            defer self.allocator.free(sub_abs);
+                            self.watchDirRecursive(sub_abs, sub_rel) catch {};
                         }
                     } else if (event.mask & IN.CREATE != 0) {
-                        try self.debouncer.recordEvent(full_path, .created);
-                        self.allocator.free(full_path);
+                        try self.debouncer.recordEvent(rel_path, .created);
+                        self.allocator.free(rel_path);
 
                         if (event.mask & IN.ISDIR != 0) {
-                            const watch_path = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_path, name });
-                            defer self.allocator.free(watch_path);
-                            self.watchDirRecursive(watch_path, 0) catch {};
+                            const sub_rel = if (dir_rel_path.len == 0)
+                                self.allocator.dupe(u8, name) catch continue
+                            else
+                                std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ dir_rel_path, name }) catch continue;
+                            defer self.allocator.free(sub_rel);
+                            const sub_abs = self.toAbsolutePath(self.allocator, sub_rel) catch continue;
+                            defer self.allocator.free(sub_abs);
+                            self.watchDirRecursive(sub_abs, sub_rel) catch {};
                         }
                     } else if (event.mask & IN.DELETE != 0) {
-                        try self.debouncer.recordEvent(full_path, .deleted);
-                        self.allocator.free(full_path);
+                        try self.debouncer.recordEvent(rel_path, .deleted);
+                        self.allocator.free(rel_path);
                     } else if (event.mask & IN.MODIFY != 0) {
-                        try self.debouncer.recordEvent(full_path, .modified);
-                        self.allocator.free(full_path);
+                        try self.debouncer.recordEvent(rel_path, .modified);
+                        self.allocator.free(rel_path);
                     } else {
-                        self.allocator.free(full_path);
+                        self.allocator.free(rel_path);
                     }
                 }
             }
@@ -1472,7 +1551,7 @@ pub const PollWatcher = struct {
             .poll_interval_ms = 2000,
         };
 
-        try self.snapshotMtimes(root, 0);
+        try self.snapshotMtimes(root, "");
         return self;
     }
 
@@ -1488,22 +1567,38 @@ pub const PollWatcher = struct {
 
     const MAX_POLL_DEPTH = 20;
 
-    fn snapshotMtimes(self: *PollWatcher, path: []const u8, depth: usize) !void {
+    fn toAbsolutePath(self: *const PollWatcher, allocator: Allocator, rel_path: []const u8) ![]const u8 {
+        if (rel_path.len == 0) {
+            return try allocator.dupe(u8, self.root);
+        }
+        return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ self.root, rel_path });
+    }
+
+    fn snapshotMtimes(self: *PollWatcher, abs_path: []const u8, rel_path: []const u8) !void {
+        return self.snapshotMtimesDepth(abs_path, rel_path, 0);
+    }
+
+    fn snapshotMtimesDepth(self: *PollWatcher, abs_path: []const u8, rel_path: []const u8, depth: usize) !void {
         if (depth > MAX_POLL_DEPTH) return;
 
-        var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch return;
+        var dir = std.fs.openDirAbsolute(abs_path, .{ .iterate = true }) catch return;
         defer dir.close();
 
         const stat = dir.stat() catch return;
-        const path_owned = try self.allocator.dupe(u8, path);
-        try self.dir_mtimes.put(path_owned, stat.mtime);
+        const rel_path_owned = try self.allocator.dupe(u8, rel_path);
+        try self.dir_mtimes.put(rel_path_owned, stat.mtime);
 
         var iter = dir.iterate();
         while (iter.next() catch return) |entry| {
             if (entry.kind == .directory and entry.name.len > 0 and entry.name[0] != '.') {
-                const subpath = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ path, entry.name });
-                defer self.allocator.free(subpath);
-                try self.snapshotMtimes(subpath, depth + 1);
+                const sub_abs = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ abs_path, entry.name });
+                defer self.allocator.free(sub_abs);
+                const sub_rel = if (rel_path.len == 0)
+                    try self.allocator.dupe(u8, entry.name)
+                else
+                    try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ rel_path, entry.name });
+                defer self.allocator.free(sub_rel);
+                try self.snapshotMtimesDepth(sub_abs, sub_rel, depth + 1);
             }
         }
     }
@@ -1516,43 +1611,52 @@ pub const PollWatcher = struct {
         self.last_poll = now;
         self.events.clearRetainingCapacity();
 
-        try self.checkDir(self.root, 0);
+        try self.checkDir(self.root, "");
         return self.events.items;
     }
 
-    fn checkDir(self: *PollWatcher, path: []const u8, depth: usize) !void {
+    fn checkDir(self: *PollWatcher, abs_path: []const u8, rel_path: []const u8) !void {
+        return self.checkDirDepth(abs_path, rel_path, 0);
+    }
+
+    fn checkDirDepth(self: *PollWatcher, abs_path: []const u8, rel_path: []const u8, depth: usize) !void {
         if (depth > MAX_POLL_DEPTH) return;
 
-        var dir = std.fs.openDirAbsolute(path, .{ .iterate = true }) catch |e| {
+        var dir = std.fs.openDirAbsolute(abs_path, .{ .iterate = true }) catch |e| {
             if (e == error.FileNotFound) {
-                try self.events.append(.{ .path = path, .kind = .deleted });
+                try self.events.append(.{ .path = rel_path, .kind = .deleted });
             }
             return;
         };
         defer dir.close();
 
         const stat = dir.stat() catch return;
-        const old_mtime = self.dir_mtimes.get(path);
+        const old_mtime = self.dir_mtimes.get(rel_path);
 
         if (old_mtime == null or old_mtime.? != stat.mtime) {
-            try self.events.append(.{ .path = path, .kind = .modified });
+            try self.events.append(.{ .path = rel_path, .kind = .modified });
 
             if (old_mtime) |_| {
-                if (self.dir_mtimes.getEntry(path)) |entry| {
+                if (self.dir_mtimes.getEntry(rel_path)) |entry| {
                     entry.value_ptr.* = stat.mtime;
                 }
             } else {
-                const path_owned = try self.allocator.dupe(u8, path);
-                try self.dir_mtimes.put(path_owned, stat.mtime);
+                const rel_path_owned = try self.allocator.dupe(u8, rel_path);
+                try self.dir_mtimes.put(rel_path_owned, stat.mtime);
             }
         }
 
         var iter = dir.iterate();
         while (iter.next() catch return) |entry| {
             if (entry.kind == .directory and entry.name.len > 0 and entry.name[0] != '.') {
-                const subpath = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ path, entry.name });
-                defer self.allocator.free(subpath);
-                try self.checkDir(subpath, depth + 1);
+                const sub_abs = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ abs_path, entry.name });
+                defer self.allocator.free(sub_abs);
+                const sub_rel = if (rel_path.len == 0)
+                    try self.allocator.dupe(u8, entry.name)
+                else
+                    try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ rel_path, entry.name });
+                defer self.allocator.free(sub_rel);
+                try self.checkDirDepth(sub_abs, sub_rel, depth + 1);
             }
         }
     }
